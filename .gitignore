@@ -1,0 +1,80 @@
+# ===========================================
+# MechSimulator .gitignore
+# ===========================================
+
+# ----- Audio Assets (Proprietary/Paid) -----
+# These are not included in the repository
+game.sounds
+sounds/
+
+# ----- Development Files -----
+Misc/
+docs/
+
+# ----- FMOD Studio Project -----
+# FMOD Studio project and bank files
+MechSimulator/
+fmod_banks/
+bank script.txt
+sounds/banks/
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# ----- Virtual Environments -----
+venv/
+ENV/
+env/
+.venv/
+
+# ----- IDE / Editor -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ----- Claude Code -----
+.claude/
+
+# ----- NVDA Addon (Separate Project) -----
+nvda_addon/
+
+# ----- Steam Audio -----
+steam_audio/
+
+# ----- DLLs (Users should obtain separately) -----
+*.dll
+
+# ----- OS Files -----
+.DS_Store
+Thumbs.db
+Desktop.ini
+nul
+
+# ----- Reaper/Audio Editing -----
+*.reapeaks
+*.RPP
+*.RPP-bak
+
+# ----- Logs and Temp Files -----
+*.log
+*.tmp
+*.temp
+*.bak
+
+# ----- Test Files -----
+test_*.py
+!tests/test_*.py
