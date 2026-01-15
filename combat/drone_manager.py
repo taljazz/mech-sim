@@ -11,9 +11,30 @@ from state.constants import (
     DRONE_SPAWN_INTERVAL,
     DRONE_SPAWN_DISTANCE_MIN, DRONE_SPAWN_DISTANCE_MAX,
     DRONE_WEAPONS, BASE_VOLUMES, AIM_ASSIST_COOLDOWN,
-    TARGET_LOCK_ANGLE, TARGET_LOCK_COOLDOWN
+    TARGET_LOCK_ANGLE, TARGET_LOCK_COOLDOWN,
+    DRONE_ATTACK_WINDUP_MS, DRONE_ATTACK_WINDUP_ENABLED
 )
 from audio.spatial import SpatialAudio
+
+# Audio logging (lazy import)
+_audio_log = None
+
+def _get_audio_log():
+    """Get the audio logging system."""
+    global _audio_log
+    if _audio_log is None:
+        try:
+            from audio.audio_logger import audio_log
+            _audio_log = audio_log
+        except ImportError:
+            class DummyLog:
+                def spatial(self, *a, **k): pass
+                def drone_state(self, *a, **k): pass
+                def drone_audio(self, *a, **k): pass
+                def attack_warning(self, *a, **k): pass
+                def hit_confirm(self, *a, **k): pass
+            _audio_log = DummyLog()
+    return _audio_log
 
 
 class DroneManager:
@@ -21,6 +42,12 @@ class DroneManager:
 
     # Panning update threshold (radians) - only update if angle changed significantly
     PAN_UPDATE_THRESHOLD = 0.05  # ~3 degrees
+
+    # Audio fade durations (milliseconds)
+    TAKEOFF_FADE_IN_MS = 200      # Fade in for drone spawn/takeoff sounds
+    PASSBY_FADE_IN_MS = 300       # Fade in for patrol passby sounds
+    SUPERSONIC_FADE_IN_MS = 150   # Fade in for engaging supersonic sounds
+    AMBIENT_CROSSFADE_MS = 250    # Crossfade between ambient sounds
 
     def __init__(self, audio_manager, sound_loader, tts, game_state):
         """Initialize the drone manager.
@@ -75,6 +102,22 @@ class DroneManager:
             return self._drone_pool.get_channels(drone_id)
         return self.audio.get_drone_channels(drone_id)
 
+    def _update_drone_fades(self, dt: float):
+        """Update fade states for all active drone audio channels.
+
+        Must be called each frame to process fade in/out transitions.
+
+        Args:
+            dt: Delta time in seconds
+        """
+        for drone in self.drones:
+            dc = self._get_drone_channels(drone['id'])
+            if dc:
+                # Update fade for all drone channels
+                for channel_name in ['ambient', 'combat', 'takeoff', 'passby', 'supersonic']:
+                    if channel_name in dc and hasattr(dc[channel_name], 'update_fade'):
+                        dc[channel_name].update_fade(dt)
+
     def update(self, current_time: int, dt: float, damage_system, camo_system) -> list:
         """Update all drones.
 
@@ -94,6 +137,9 @@ class DroneManager:
 
         # Mark active drones cache as dirty at start of frame
         self._active_drones_dirty = True
+
+        # Update fade states for all drone audio channels
+        self._update_drone_fades(dt)
 
         # Spawn check - use cached active count
         if current_time - self.spawn_timer >= DRONE_SPAWN_INTERVAL:
@@ -199,14 +245,19 @@ class DroneManager:
         # Calculate initial spatial audio for the new drone
         self._update_spatial_audio(drone)
 
-        # Play spawn sound using 3D positioning (position set before playing)
+        # Play spawn sound using dedicated takeoff channel (won't cut off other sounds)
         dc = self._get_drone_channels(drone['id'])
         if dc:
             sound = self.sounds.get_drone_sound('takeoffs')
             if sound:
                 pos = self._get_drone_3d_position(drone)
-                dc['ambient'].play(sound, position_3d=pos)
-                self._set_3d_position(dc['ambient'], drone)  # Apply directional filter
+                dc['takeoff'].play_with_fade_in(
+                    sound,
+                    fade_in_ms=self.TAKEOFF_FADE_IN_MS,
+                    position_3d=pos
+                )
+                self._set_3d_position(dc['takeoff'], drone, 'takeoff')  # Apply directional filter
+                drone['takeoff_playing'] = True
 
         self.tts.speak("Hostile detected")
         print(f"Drone {drone['id']} spawned at ({spawn_x:.1f}, {spawn_y:.1f})")
@@ -239,6 +290,7 @@ class DroneManager:
         drone['distance'] = distance
         drone['relative_angle'] = rel_angle
         drone['altitude_diff'] = alt_diff
+        drone['dt'] = dt  # Store dt for use in other methods
 
         # Calculate velocity for Doppler effect (meters per second)
         if dt > 0.001:  # Avoid division by zero
@@ -258,6 +310,17 @@ class DroneManager:
             drone['prev_y'] = drone['y']
             drone['prev_altitude'] = drone.get('altitude', 50)
 
+        # === LOGGING ===
+        alog = _get_audio_log()
+        alog.spatial(
+            source=f"Drone {drone['id']}",
+            pan=pan,
+            volume=vol,
+            distance=distance,
+            angle=rel_angle,
+            altitude_diff=alt_diff / 3.28 if alt_diff else 0  # Convert to meters for display
+        )
+
     def _get_cached_spatial(self, drone: dict) -> tuple:
         """Get cached spatial audio pan and volume for a drone.
 
@@ -275,6 +338,80 @@ class DroneManager:
         base_vol = BASE_VOLUMES.get('drone', 0.8)
         self.spatial.apply_stereo_pan(channel, pan, vol, base_vol, self.audio.master_volume)
 
+    def _apply_dynamic_pitch(self, channel, drone: dict, distance: float):
+        """Apply dynamic pitch variation based on distance and drone speed.
+
+        Creates more immersive audio by:
+        - Higher pitch when close (more urgent/aggressive feel)
+        - Lower pitch when far (atmospheric, distant feel)
+        - Additional pitch boost when drone is moving fast (charging)
+
+        Args:
+            channel: FMODChannelWrapper to adjust
+            drone: Drone dictionary with position and velocity data
+            distance: Distance to drone in meters
+        """
+        if not channel or not hasattr(channel, 'set_pitch'):
+            return
+
+        try:
+            from state.constants import (
+                AUDIO_DISTANCE_CLOSE, AUDIO_DISTANCE_MEDIUM, AUDIO_DISTANCE_FAR,
+                AUDIO_PITCH_CLOSE, AUDIO_PITCH_MEDIUM, AUDIO_PITCH_FAR,
+                AUDIO_SPEED_THRESHOLD, AUDIO_SPEED_PITCH_BOOST
+            )
+        except ImportError:
+            # Use defaults if constants not defined
+            AUDIO_DISTANCE_CLOSE = 20.0
+            AUDIO_DISTANCE_MEDIUM = 40.0
+            AUDIO_DISTANCE_FAR = 60.0
+            AUDIO_PITCH_CLOSE = 1.05
+            AUDIO_PITCH_MEDIUM = 1.0
+            AUDIO_PITCH_FAR = 0.95
+            AUDIO_SPEED_THRESHOLD = 5.0
+            AUDIO_SPEED_PITCH_BOOST = 0.1
+
+        # Calculate distance-based pitch
+        if distance <= AUDIO_DISTANCE_CLOSE:
+            # Close: interpolate between close and medium pitch
+            factor = distance / AUDIO_DISTANCE_CLOSE
+            base_pitch = AUDIO_PITCH_CLOSE + factor * (AUDIO_PITCH_MEDIUM - AUDIO_PITCH_CLOSE)
+        elif distance <= AUDIO_DISTANCE_MEDIUM:
+            # Medium: interpolate between medium and far pitch
+            factor = (distance - AUDIO_DISTANCE_CLOSE) / (AUDIO_DISTANCE_MEDIUM - AUDIO_DISTANCE_CLOSE)
+            base_pitch = AUDIO_PITCH_MEDIUM + factor * (AUDIO_PITCH_FAR - AUDIO_PITCH_MEDIUM)
+        else:
+            # Far: use far pitch, slightly lower for very distant
+            if distance >= AUDIO_DISTANCE_FAR:
+                base_pitch = AUDIO_PITCH_FAR * 0.98  # Extra low for very far
+            else:
+                factor = (distance - AUDIO_DISTANCE_MEDIUM) / (AUDIO_DISTANCE_FAR - AUDIO_DISTANCE_MEDIUM)
+                base_pitch = AUDIO_PITCH_FAR + factor * (AUDIO_PITCH_FAR * 0.98 - AUDIO_PITCH_FAR)
+
+        # Add speed-based pitch boost
+        velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+        speed = (velocity[0]**2 + velocity[1]**2 + velocity[2]**2) ** 0.5
+
+        pitch_boost = 0.0
+        if speed > AUDIO_SPEED_THRESHOLD:
+            # Drone is moving fast - add urgency via pitch boost
+            speed_factor = min(1.0, (speed - AUDIO_SPEED_THRESHOLD) / AUDIO_SPEED_THRESHOLD)
+            pitch_boost = speed_factor * AUDIO_SPEED_PITCH_BOOST
+            base_pitch += pitch_boost
+
+        # Apply the calculated pitch
+        channel.set_pitch(base_pitch)
+
+        # === LOGGING ===
+        alog = _get_audio_log()
+        alog.pitch(
+            source=f"Drone {drone['id']}",
+            distance=distance,
+            base_pitch=base_pitch,
+            speed=speed,
+            speed_boost=pitch_boost
+        )
+
     def _get_drone_3d_position(self, drone: dict):
         """Get 3D position tuple for a drone (for passing to play()).
 
@@ -285,11 +422,19 @@ class DroneManager:
         altitude_meters = drone_altitude / 3.28
         return (drone['x'], drone['y'], altitude_meters)
 
-    def _set_3d_position(self, channel, drone: dict):
+    def _set_3d_position(self, channel, drone: dict, channel_type: str = 'ambient', dt: float = 0.016):
         """Set 3D position and directional filters for a channel based on drone location.
 
         Uses FMOD's native 3D spatialization plus directional filtering for
         front/behind and above/below perception. Also sets velocity for Doppler effect.
+        Includes smooth occlusion transitions to prevent jarring audio changes.
+        Also updates distance-based reverb for spatial depth perception.
+
+        Args:
+            channel: FMODChannelWrapper to position
+            drone: Drone dictionary with position data
+            channel_type: Type of channel ('ambient', 'combat') for unique ID
+            dt: Delta time in seconds for smooth interpolation
         """
         if channel and hasattr(channel, 'set_3d_position'):
             # Convert altitude from feet to meters for audio positioning
@@ -309,10 +454,31 @@ class DroneManager:
                 self.state.player_x, self.state.player_y, self.state.player_altitude,
                 self.state.facing_angle
             )
+
+            # Create unique channel ID for smooth occlusion transitions
+            channel_id = f"drone_{drone['id']}_{channel_type}"
+
+            # Apply directional filter with dt for smooth interpolation
             self.audio.apply_directional_filter(
                 channel, relative_angle, altitude_diff, distance,
-                apply_air_absorption=True, apply_occlusion=True
+                apply_air_absorption=True, apply_occlusion=True,
+                channel_id=channel_id,
+                dt=dt
             )
+
+            # Update distance-based reverb for spatial depth perception
+            # Only update for ambient channels to avoid duplicate calls
+            # Pass player altitude for environmental depth (more reverb when flying high)
+            if channel_type == 'ambient':
+                self.audio.fmod.update_distance_reverb(
+                    distance,
+                    enabled=True,
+                    player_altitude=self.state.player_altitude
+                )
+
+            # === DYNAMIC AUDIO VARIATION ===
+            # Apply pitch variation based on distance and speed for more immersive audio
+            self._apply_dynamic_pitch(channel, drone, distance)
 
     def _update_drone_state(self, drone: dict, camo_effective: bool,
                             current_time: int, dt: float, damage_system):
@@ -371,9 +537,28 @@ class DroneManager:
                 self.tts.speak("Drone lost contact")
                 self._play_scan_sound(drone)
             elif drone['distance'] <= DRONE_ATTACK_RANGE:
+                # Transition to wind-up state for pre-attack warning
+                if DRONE_ATTACK_WINDUP_ENABLED:
+                    drone['state'] = 'winding_up'
+                    drone['state_start'] = current_time
+                    self._play_attack_windup(drone)
+                else:
+                    drone['state'] = 'attacking'
+                    drone['state_start'] = current_time
+                    self._execute_attack(drone, damage_system, current_time)
+
+        elif state == 'winding_up':
+            # Pre-attack warning state - gives player ~200ms to react
+            if current_time - drone['state_start'] >= DRONE_ATTACK_WINDUP_MS:
                 drone['state'] = 'attacking'
                 drone['state_start'] = current_time
+                # Log state change
+                alog = _get_audio_log()
+                alog.drone_state(drone['id'], 'attacking', drone['distance'], old_state='winding_up')
                 self._execute_attack(drone, damage_system, current_time)
+            # Drone still tracks player during wind-up
+            drone['last_known_x'] = self.state.player_x
+            drone['last_known_y'] = self.state.player_y
 
         elif state == 'searching':
             target = (drone.get('last_known_x', self.state.player_x),
@@ -541,7 +726,7 @@ class DroneManager:
             if dc:
                 pos = self._get_drone_3d_position(drone)
                 dc['combat'].play(sound, position_3d=pos)
-                self._set_3d_position(dc['combat'], drone)  # Apply directional filter
+                self._set_3d_position(dc['combat'], drone, 'combat')  # Apply directional filter
 
     def _play_scan_sound(self, drone: dict):
         """Play drone scanning sound with 3D positioning."""
@@ -551,31 +736,101 @@ class DroneManager:
             if dc:
                 pos = self._get_drone_3d_position(drone)
                 dc['combat'].play(sound, position_3d=pos)
-                self._set_3d_position(dc['combat'], drone)  # Apply directional filter
+                self._set_3d_position(dc['combat'], drone, 'combat')  # Apply directional filter
+
+    def _play_attack_windup(self, drone: dict):
+        """Play pre-attack warning sound with 3D positioning.
+
+        This gives players a ~200ms audio cue before the attack starts,
+        allowing reaction time for shield activation or evasion.
+        """
+        # === LOGGING ===
+        alog = _get_audio_log()
+        alog.attack_warning(
+            drone_id=drone['id'],
+            windup_ms=DRONE_ATTACK_WINDUP_MS,
+            distance=drone['distance']
+        )
+        alog.drone_state(drone['id'], 'winding_up', drone['distance'], old_state='engaging')
+
+        # Use beacons sound as wind-up warning (higher pitch conveys urgency)
+        # Could also use a dedicated 'windup' sound if available
+        sound = self.sounds.get_drone_sound('beacons')
+        if sound:
+            dc = self._get_drone_channels(drone['id'])
+            if dc:
+                pos = self._get_drone_3d_position(drone)
+                velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+                dc['combat'].play(sound, position_3d=pos, velocity=velocity)
+                self._set_3d_position(dc['combat'], drone, 'combat')
+                alog.drone_audio(drone['id'], 'windup_beacon', 'play')
 
     def _update_ambient_audio(self, drone: dict, current_time: int):
-        """Update drone ambient/movement audio with 3D positioning."""
-        if drone['state'] not in ('patrol', 'engaging', 'cooldown'):
+        """Update drone ambient/movement audio with 3D positioning.
+
+        Sound volume is controlled by FMOD 3D distance attenuation.
+        Sounds loop continuously while drone is active.
+        """
+        # Allow ambient audio during all active drone states
+        # (not during spawning, destroyed, or searching when drone lost player)
+        if drone['state'] not in ('patrol', 'detecting', 'engaging', 'attacking', 'cooldown'):
             return
 
         dc = self._get_drone_channels(drone['id'])
         if not dc:
             return
 
-        if not dc['ambient'].get_busy():
-            if drone['state'] == 'engaging':
-                sound = self.sounds.get_drone_sound('supersonics')
-            else:
-                sound = self.sounds.get_drone_sound('passbys')
+        # Determine which sound type is needed based on drone behavior
+        # Supersonic for aggressive states (engaging, attacking), passby for patrol
+        need_supersonic = (drone['state'] in ('engaging', 'attacking'))
 
-            if sound:
-                # Play sound with 3D position set before playing (for proper distance attenuation)
-                pos = self._get_drone_3d_position(drone)
-                dc['ambient'].play(sound, position_3d=pos)
-                self._set_3d_position(dc['ambient'], drone)  # Apply directional filter
+        # Get drone position for 3D audio
+        pos = self._get_drone_3d_position(drone)
+
+        # Get dt from drone (stored during spatial audio update)
+        dt = drone.get('dt', 0.016)
+
+        # Update takeoff channel position if still playing
+        if dc['takeoff'].get_busy():
+            self._set_3d_position(dc['takeoff'], drone, 'takeoff', dt=dt)
+
+        # Handle passby channel (patrol sounds) - separate channel, won't cut off others
+        if not need_supersonic:
+            # Need passby sound - stop supersonic if playing, start/continue passby
+            if dc['supersonic'].get_busy():
+                dc['supersonic'].fade_out(self.AMBIENT_CROSSFADE_MS)
+
+            if not dc['passby'].get_busy():
+                # Start new passby sound
+                sound = self.sounds.get_drone_sound('passbys')
+                if sound:
+                    dc['passby'].play_with_fade_in(
+                        sound,
+                        fade_in_ms=self.PASSBY_FADE_IN_MS,
+                        loops=0,
+                        mono_downmix=True,
+                        position_3d=pos
+                    )
+            # Update 3D position
+            self._set_3d_position(dc['passby'], drone, 'passby', dt=dt)
         else:
-            # Update 3D position continuously for moving drone
-            self._set_3d_position(dc['ambient'], drone)
+            # Need supersonic sound - stop passby if playing, start/continue supersonic
+            if dc['passby'].get_busy():
+                dc['passby'].fade_out(self.AMBIENT_CROSSFADE_MS)
+
+            if not dc['supersonic'].get_busy():
+                # Start new supersonic sound
+                sound = self.sounds.get_drone_sound('supersonics')
+                if sound:
+                    dc['supersonic'].play_with_fade_in(
+                        sound,
+                        fade_in_ms=self.SUPERSONIC_FADE_IN_MS,
+                        loops=0,
+                        mono_downmix=True,
+                        position_3d=pos
+                    )
+            # Update 3D position
+            self._set_3d_position(dc['supersonic'], drone, 'supersonic', dt=dt)
 
     def _execute_attack(self, drone: dict, damage_system, current_time: int):
         """Initialize drone attack on player - sets up rapid fire state."""
@@ -631,13 +886,16 @@ class DroneManager:
                 weapon_type = drone.get('attack_weapon', 'pulse_cannon')
                 weapon = DRONE_WEAPONS.get(weapon_type, DRONE_WEAPONS['pulse_cannon'])
 
-                # Play weapon sound with 3D positioning (position set before playing)
+                # Play weapon sound with 3D positioning at drone's exact location
                 dc = self._get_drone_channels(drone['id'])
                 weapon_sound = self.sounds.get_drone_sound(weapon_type)
                 if weapon_sound and dc:
                     pos = self._get_drone_3d_position(drone)
-                    dc['combat'].play(weapon_sound, position_3d=pos)
-                    self._set_3d_position(dc['combat'], drone)  # Apply directional filter
+                    velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+                    # Play with position and velocity for proper 3D + Doppler
+                    dc['combat'].play(weapon_sound, position_3d=pos, velocity=velocity)
+                    # Apply directional filters (lowpass for behind, etc.)
+                    self._set_3d_position(dc['combat'], drone, 'combat')
 
                 # Check if this shot hits
                 hit_chance = drone.get('hit_chance', 0.5)
@@ -740,7 +998,13 @@ class DroneManager:
                 break
 
     def damage_drone(self, drone: dict, damage: float) -> bool:
-        """Apply damage to a drone.
+        """Apply damage to a drone with hit confirmation audio feedback.
+
+        Hit confirmation varies based on damage dealt and remaining health:
+        - Light hit: Standard interface beep
+        - Heavy hit (25+ damage): Higher-pitched confirmation
+        - Critical hit (50+ damage): More urgent sound
+        - Kill: Distinct destruction confirmation
 
         Args:
             drone: Drone dict
@@ -749,18 +1013,76 @@ class DroneManager:
         Returns:
             True if drone was destroyed
         """
+        old_health = drone['health']
         drone['health'] -= damage
 
-        # Play hit feedback
-        sound = self.sounds.get_drone_sound('interfaces')
-        if sound:
-            channel = self.audio.get_channel('player_damage')
-            channel.set_volume(0.5 * self.audio.master_volume)
-            channel.play(sound)
+        # Determine hit confirmation tier based on damage and remaining health
+        health_percent = max(0, drone['health'] / 100.0)
+        is_kill = drone['health'] <= 0
 
-        if drone['health'] <= 0:
+        # Get hit confirmation constants
+        try:
+            from state.constants import HIT_CONFIRM_DAMAGE_THRESHOLDS, HIT_CONFIRM_KILL_SOUND
+        except ImportError:
+            HIT_CONFIRM_DAMAGE_THRESHOLDS = [25, 50, 75]
+            HIT_CONFIRM_KILL_SOUND = True
+
+        # Select sound and volume based on hit tier
+        channel = self.audio.get_channel('player_damage')
+        alog = _get_audio_log()
+
+        if is_kill and HIT_CONFIRM_KILL_SOUND:
+            # Kill confirmation - use explosion/interface combination
+            # Play the destruction sound first for dramatic effect
+            alog.hit_confirm(drone['id'], damage, 0, 0.8, is_kill=True)
             self._destroy_drone(drone)
+            # Additional kill confirmation sound
+            sound = self.sounds.get_drone_sound('interfaces')
+            if sound:
+                channel.set_volume(0.8 * self.audio.master_volume)
+                channel.play(sound)
             return True
+        elif damage >= HIT_CONFIRM_DAMAGE_THRESHOLDS[2]:
+            # Massive hit (75+ damage) - loudest confirmation
+            vol = 0.9
+            alog.hit_confirm(drone['id'], damage, drone['health'], vol)
+            sound = self.sounds.get_drone_sound('interfaces')
+            if sound:
+                channel.set_volume(vol * self.audio.master_volume)
+                channel.play(sound)
+        elif damage >= HIT_CONFIRM_DAMAGE_THRESHOLDS[1]:
+            # Critical hit (50+ damage) - loud confirmation
+            vol = 0.75
+            alog.hit_confirm(drone['id'], damage, drone['health'], vol)
+            sound = self.sounds.get_drone_sound('interfaces')
+            if sound:
+                channel.set_volume(vol * self.audio.master_volume)
+                channel.play(sound)
+        elif damage >= HIT_CONFIRM_DAMAGE_THRESHOLDS[0]:
+            # Heavy hit (25+ damage) - moderate confirmation
+            vol = 0.6
+            alog.hit_confirm(drone['id'], damage, drone['health'], vol)
+            sound = self.sounds.get_drone_sound('interfaces')
+            if sound:
+                channel.set_volume(vol * self.audio.master_volume)
+                channel.play(sound)
+        else:
+            # Light hit - standard feedback
+            vol = 0.4
+            alog.hit_confirm(drone['id'], damage, drone['health'], vol)
+            sound = self.sounds.get_drone_sound('interfaces')
+            if sound:
+                channel.set_volume(vol * self.audio.master_volume)
+                channel.play(sound)
+
+        # Announce critical damage thresholds
+        if drone['health'] > 0:
+            if old_health > 50 and drone['health'] <= 50:
+                # Drone half health
+                pass  # Could add TTS: "Hostile damaged"
+            elif old_health > 25 and drone['health'] <= 25:
+                self.tts.speak("Hostile critical", duck_audio=False)
+
         return False
 
     def _destroy_drone(self, drone: dict):
@@ -781,7 +1103,7 @@ class DroneManager:
             explosion_channel = dc.get('debris', dc.get('combat'))
             if explosion_channel:
                 explosion_channel.play(explosion, position_3d=pos)
-                self._set_3d_position(explosion_channel, drone)
+                self._set_3d_position(explosion_channel, drone, 'explosion')
 
         # Play debris sound - use 'weapon' channel if available (4-channel pool)
         # else fall back to 'ambient' channel (2-channel legacy)
@@ -790,7 +1112,7 @@ class DroneManager:
             debris_channel = dc.get('weapon', dc.get('ambient'))
             if debris_channel:
                 debris_channel.play(debris, position_3d=pos)
-                self._set_3d_position(debris_channel, drone)
+                self._set_3d_position(debris_channel, drone, 'debris')
 
         self.tts.speak("Hostile destroyed")
         print(f"Drone {drone['id']} destroyed!")

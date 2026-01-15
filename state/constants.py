@@ -171,12 +171,12 @@ MAX_DRONES_CONFIGURABLE = 6  # Maximum selectable in config menu
 DEFAULT_DRONE_COUNT = 2  # Default selection in config menu
 
 # Drone audio pool settings
-DRONE_CHANNELS_PER_DRONE = 4  # ambient, combat, weapon, debris
+DRONE_CHANNELS_PER_DRONE = 7  # ambient, combat, weapon, debris, takeoff, passby, supersonic
 DRONE_CROSSFADE_OUT_MS = 100  # Fade out time for sound transitions
 DRONE_CROSSFADE_IN_MS = 50    # Fade in time for sound transitions
 DRONE_SPAWN_INTERVAL = 10000  # Milliseconds
-DRONE_SPAWN_DISTANCE_MIN = 30
-DRONE_SPAWN_DISTANCE_MAX = 50
+DRONE_SPAWN_DISTANCE_MIN = 15  # Can spawn close for immediate threat
+DRONE_SPAWN_DISTANCE_MAX = 80  # Or far away, giving time to prepare
 DRONE_BASE_SPEED = 5.0
 DRONE_CLIMB_RATE = 15.0  # Feet per second
 DRONE_ENGAGE_SPEED_MULT = 2.0  # Speed multiplier when engaging (increased from 1.5)
@@ -295,3 +295,87 @@ OCCLUSION_VOLUME_REDUCTION = 0.7       # Volume multiplier when fully occluded (
 
 # Doppler effect - pitch shifting for moving sound sources
 DOPPLER_SCALE = 0.5  # 0.0 = disabled, 1.0 = realistic, 0.5 = subtle
+
+# =============================================================================
+# ENHANCED AUDIO SETTINGS (Research-based improvements)
+# =============================================================================
+
+# Logarithmic rolloff settings (more natural than linear)
+# Uses inverse square law: volume halves per doubling of distance
+ROLLOFF_MODE = 'logarithmic'  # 'linear' or 'logarithmic'
+ROLLOFF_REFERENCE_DISTANCE = 1.0  # Distance where sound is at full volume
+
+# Smooth occlusion transitions (prevents jarring filter changes)
+# Higher values = faster transitions (20.0 = ~50ms to reach target)
+OCCLUSION_INTERPOLATION_SPEED = 20.0  # How fast filters transition (per second)
+OCCLUSION_MIN_CHANGE_THRESHOLD = 0.02  # Minimum change to trigger update
+
+# Enhanced front/back distinction
+REAR_LOWPASS_CUTOFF = 18000  # Hz - gentle lowpass for rear (subtle high-freq roll-off)
+REAR_LOWPASS_START_ANGLE = 90  # Degrees - where rear filtering starts
+REAR_VOLUME_REDUCTION = 0.0  # No volume reduction - only use lowpass for distinction
+
+# Pre-attack audio warning
+DRONE_ATTACK_WINDUP_MS = 200  # Milliseconds of warning before attack
+DRONE_ATTACK_WINDUP_ENABLED = True
+
+# Audio ducking settings
+TTS_DUCK_VOLUME = 0.4  # Volume during TTS (40%)
+TTS_DUCK_SPEED = 8.0  # Fade speed for ducking
+COMBAT_DUCK_VOLUME = 0.6  # Volume during combat events
+COMBAT_DUCK_SPEED = 6.0
+
+# Compressor DSP settings (prevents clipping during intense damage)
+COMPRESSOR_THRESHOLD_DB = -12.0  # Start compressing at this level
+COMPRESSOR_RATIO = 4.0  # Compression ratio (4:1)
+COMPRESSOR_ATTACK_MS = 10.0  # Attack time
+COMPRESSOR_RELEASE_MS = 100.0  # Release time
+
+# Hit confirmation settings
+HIT_CONFIRM_DAMAGE_THRESHOLDS = [25, 50, 75]  # Damage thresholds for sound variation
+HIT_CONFIRM_KILL_SOUND = True  # Play distinct sound for kills
+
+# Reverb distance scaling
+REVERB_DISTANCE_START = 15.0  # Distance where reverb starts increasing
+REVERB_DISTANCE_MAX = 60.0  # Distance where reverb is at maximum
+REVERB_WET_MIN_DB = -30.0  # Minimum reverb wet level (close sounds)
+REVERB_WET_MAX_DB = -10.0  # Maximum reverb wet level (distant sounds)
+REVERB_DECAY_MIN_MS = 800  # Minimum decay time
+REVERB_DECAY_MAX_MS = 2500  # Maximum decay time
+
+# =============================================================================
+# DYNAMIC AUDIO VARIATION
+# =============================================================================
+# Distance-based sound intensity (pitch and volume modulation)
+AUDIO_DISTANCE_CLOSE = 20.0  # Distance threshold for "close" sounds
+AUDIO_DISTANCE_MEDIUM = 40.0  # Distance threshold for "medium" sounds
+AUDIO_DISTANCE_FAR = 60.0  # Distance threshold for "far" sounds
+
+# Pitch variation based on distance (1.0 = normal, <1.0 = lower, >1.0 = higher)
+AUDIO_PITCH_CLOSE = 1.05  # Slightly higher pitch when close (more urgent)
+AUDIO_PITCH_MEDIUM = 1.0  # Normal pitch at medium distance
+AUDIO_PITCH_FAR = 0.95  # Slightly lower pitch when far (atmospheric)
+
+# Speed-based sound intensity (for moving drones)
+AUDIO_SPEED_THRESHOLD = 5.0  # Speed above which drone sounds more aggressive
+AUDIO_SPEED_PITCH_BOOST = 0.1  # Additional pitch when drone moving fast
+AUDIO_SPEED_VOLUME_BOOST = 0.15  # Additional volume when drone moving fast
+
+# =============================================================================
+# ENVIRONMENTAL AUDIO DEPTH
+# =============================================================================
+# Altitude-based reverb (more reverb when flying high = open sky)
+ALTITUDE_REVERB_GROUND = 0.0  # Altitude in feet considered "ground level"
+ALTITUDE_REVERB_LOW = 50.0  # Low altitude threshold
+ALTITUDE_REVERB_HIGH = 200.0  # High altitude threshold
+ALTITUDE_REVERB_MULTIPLIER_GROUND = 0.7  # Reverb multiplier on ground (less reverb)
+ALTITUDE_REVERB_MULTIPLIER_HIGH = 1.4  # Reverb multiplier at high altitude (more reverb)
+
+# Altitude-based decay (longer decay at high altitude = open space)
+ALTITUDE_DECAY_MULTIPLIER_GROUND = 0.8  # Shorter decay on ground
+ALTITUDE_DECAY_MULTIPLIER_HIGH = 1.3  # Longer decay at high altitude
+
+# Echo effect for very distant sounds
+AUDIO_ECHO_DISTANCE_START = 50.0  # Distance where echo starts
+AUDIO_ECHO_DELAY_MS = 80  # Echo delay in milliseconds
+AUDIO_ECHO_FEEDBACK = 0.3  # Echo feedback amount (0-1)

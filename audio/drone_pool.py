@@ -14,14 +14,17 @@ from audio.logging import audio_log
 class DroneAudioPool:
     """Pool-based audio channel management for drones.
 
-    Provides 4 channels per drone for better sound separation:
-    - ambient: Movement/patrol sounds (passbys, supersonics)
+    Provides 7 channels per drone for better sound separation:
+    - ambient: General ambient/idle sounds
     - combat: Combat engagement sounds (beacons, scans, detection)
     - weapon: Weapon fire sounds (pulse, plasma, rail)
     - debris: Destruction sounds (explosion, debris)
+    - takeoff: Drone spawn/launch sounds (plays independently)
+    - passby: Patrol movement sounds (plays independently)
+    - supersonic: Engaging/aggressive movement sounds (plays independently)
     """
 
-    CHANNEL_TYPES = ['ambient', 'combat', 'weapon', 'debris']
+    CHANNEL_TYPES = ['ambient', 'combat', 'weapon', 'debris', 'takeoff', 'passby', 'supersonic']
 
     def __init__(self, fmod_audio, max_drones: int = 6):
         """Initialize drone audio pool.

@@ -27,6 +27,7 @@ from pyfmodex.enums import DSP_TYPE
 
 # Import audio logger (lazy import to avoid circular dependency)
 _audio_logger = None
+_audio_log = None
 
 def _get_logger():
     """Get the audio logger instance (lazy initialization)."""
@@ -45,6 +46,27 @@ def _get_logger():
                 def debug(self, *args, **kwargs): pass
             _audio_logger = DummyLogger()
     return _audio_logger
+
+def _get_audio_log():
+    """Get the new audio logging system (lazy initialization)."""
+    global _audio_log
+    if _audio_log is None:
+        try:
+            from audio.audio_logger import audio_log
+            _audio_log = audio_log
+        except ImportError:
+            # Fallback if logging module not available
+            class DummyAudioLog:
+                def spatial(self, *args, **kwargs): pass
+                def occlusion(self, *args, **kwargs): pass
+                def reverb(self, *args, **kwargs): pass
+                def ducking(self, *args, **kwargs): pass
+                def rolloff(self, *args, **kwargs): pass
+                def compressor(self, *args, **kwargs): pass
+                def general(self, *args, **kwargs): pass
+                def hrtf(self, *args, **kwargs): pass
+            _audio_log = DummyAudioLog()
+    return _audio_log
 
 
 class MechAudio:
@@ -78,6 +100,16 @@ class MechAudio:
         self._reverb_enabled_once = False
         self._lowpass_enabled_once = False
         self._distortion_enabled_once = False
+
+        # Smooth occlusion transition state (per-channel tracking)
+        # Maps channel_id -> {'lowpass_gain': float, 'volume_mult': float, 'last_update': time}
+        self._occlusion_states = {}
+        self._occlusion_interpolation_speed = 8.0  # Units per second
+
+        # Distance-based reverb state
+        self._distance_reverb_enabled = False
+        self._current_reverb_wet = -30.0
+        self._current_reverb_decay = 800
 
     def init(self, max_channels=64):
         """Initialize FMOD system with optimal settings for game audio.
@@ -212,6 +244,66 @@ class MechAudio:
         except Exception as e:
             print(f"DSP highpass creation warning: {e}")
             return False
+
+    def _ensure_compressor_dsp(self):
+        """Lazily create compressor DSP on first use (prevents clipping during damage)."""
+        if not hasattr(self, '_compressor_dsp'):
+            self._compressor_dsp = None
+        if self._compressor_dsp is not None:
+            return True
+        try:
+            self._compressor_dsp = self.system.create_dsp_by_type(DSP_TYPE.COMPRESSOR)
+            # Set compressor parameters for damage effects
+            # Prevents clipping during intense combat
+            self._compressor_dsp.set_parameter_float(0, -12.0)  # Threshold (dB)
+            self._compressor_dsp.set_parameter_float(1, 4.0)    # Ratio (4:1)
+            self._compressor_dsp.set_parameter_float(2, 10.0)   # Attack (ms)
+            self._compressor_dsp.set_parameter_float(3, 100.0)  # Release (ms)
+            self._compressor_dsp.set_parameter_float(4, 0.0)    # Makeup gain (dB)
+            self._compressor_dsp.bypass = True
+            print("DSP: Compressor created (lazy)")
+            return True
+        except Exception as e:
+            print(f"DSP compressor creation warning: {e}")
+            return False
+
+    def set_compressor(self, threshold_db=-12.0, ratio=4.0, enabled=True, reason=""):
+        """Enable/configure compressor to prevent clipping during intense audio.
+
+        Args:
+            threshold_db: Level at which compression starts (-60 to 0 dB)
+            ratio: Compression ratio (1.0 to 50.0, e.g., 4.0 = 4:1)
+            enabled: If True, enable compressor; if False, bypass it
+            reason: Optional reason for enabling (for logging)
+
+        Use during combat or damage effects to prevent audio clipping.
+        """
+        if not self._ensure_compressor_dsp():
+            return
+
+        try:
+            threshold_db = max(-60, min(0, threshold_db))
+            ratio = max(1.0, min(50.0, ratio))
+            self._compressor_dsp.set_parameter_float(0, threshold_db)
+            self._compressor_dsp.set_parameter_float(1, ratio)
+            self._compressor_dsp.bypass = not enabled
+
+            if enabled and self._compressor_dsp not in self.channel_groups.get('_master_dsp', []):
+                self.add_dsp_to_master(self._compressor_dsp)
+                if '_master_dsp' not in self.channel_groups:
+                    self.channel_groups['_master_dsp'] = []
+                self.channel_groups['_master_dsp'].append(self._compressor_dsp)
+
+            # === LOGGING ===
+            alog = _get_audio_log()
+            alog.compressor(
+                threshold_db=threshold_db,
+                ratio=ratio,
+                enabled=enabled,
+                reason=reason
+            )
+        except Exception as e:
+            print(f"Failed to set compressor: {e}")
 
     def create_dsp_effect(self, dsp_type, name):
         """Create a named DSP effect for later use.
@@ -384,6 +476,120 @@ class MechAudio:
         except Exception as e:
             print(f"Failed to set distortion: {e}")
 
+    def update_distance_reverb(self, distance, enabled=True, player_altitude=0.0):
+        """Update reverb based on distance and altitude for spatial depth perception.
+
+        Distant sounds should have more reverb to simulate environmental acoustics.
+        Higher altitude adds more reverb (open sky feeling).
+        This creates a sense of space and distance beyond simple volume attenuation.
+
+        Args:
+            distance: Distance to the primary sound source in meters
+            enabled: If True, apply distance-based reverb scaling
+            player_altitude: Player altitude in feet (affects reverb intensity)
+        """
+        if not enabled:
+            if self._distance_reverb_enabled:
+                self.set_reverb(enabled=False)
+                self._distance_reverb_enabled = False
+            return
+
+        try:
+            from state.constants import (
+                REVERB_DISTANCE_START, REVERB_DISTANCE_MAX,
+                REVERB_WET_MIN_DB, REVERB_WET_MAX_DB,
+                REVERB_DECAY_MIN_MS, REVERB_DECAY_MAX_MS,
+                ALTITUDE_REVERB_GROUND, ALTITUDE_REVERB_LOW, ALTITUDE_REVERB_HIGH,
+                ALTITUDE_REVERB_MULTIPLIER_GROUND, ALTITUDE_REVERB_MULTIPLIER_HIGH,
+                ALTITUDE_DECAY_MULTIPLIER_GROUND, ALTITUDE_DECAY_MULTIPLIER_HIGH
+            )
+        except ImportError:
+            REVERB_DISTANCE_START = 15.0
+            REVERB_DISTANCE_MAX = 60.0
+            REVERB_WET_MIN_DB = -30.0
+            REVERB_WET_MAX_DB = -10.0
+            REVERB_DECAY_MIN_MS = 800
+            REVERB_DECAY_MAX_MS = 2500
+            ALTITUDE_REVERB_GROUND = 0.0
+            ALTITUDE_REVERB_LOW = 50.0
+            ALTITUDE_REVERB_HIGH = 200.0
+            ALTITUDE_REVERB_MULTIPLIER_GROUND = 0.7
+            ALTITUDE_REVERB_MULTIPLIER_HIGH = 1.4
+            ALTITUDE_DECAY_MULTIPLIER_GROUND = 0.8
+            ALTITUDE_DECAY_MULTIPLIER_HIGH = 1.3
+
+        # Calculate altitude-based multipliers
+        if player_altitude <= ALTITUDE_REVERB_GROUND:
+            altitude_wet_mult = ALTITUDE_REVERB_MULTIPLIER_GROUND
+            altitude_decay_mult = ALTITUDE_DECAY_MULTIPLIER_GROUND
+        elif player_altitude >= ALTITUDE_REVERB_HIGH:
+            altitude_wet_mult = ALTITUDE_REVERB_MULTIPLIER_HIGH
+            altitude_decay_mult = ALTITUDE_DECAY_MULTIPLIER_HIGH
+        else:
+            # Interpolate between ground and high altitude
+            if player_altitude <= ALTITUDE_REVERB_LOW:
+                # Ground to low altitude
+                factor = player_altitude / ALTITUDE_REVERB_LOW
+                altitude_wet_mult = ALTITUDE_REVERB_MULTIPLIER_GROUND + factor * (1.0 - ALTITUDE_REVERB_MULTIPLIER_GROUND)
+                altitude_decay_mult = ALTITUDE_DECAY_MULTIPLIER_GROUND + factor * (1.0 - ALTITUDE_DECAY_MULTIPLIER_GROUND)
+            else:
+                # Low to high altitude
+                factor = (player_altitude - ALTITUDE_REVERB_LOW) / (ALTITUDE_REVERB_HIGH - ALTITUDE_REVERB_LOW)
+                altitude_wet_mult = 1.0 + factor * (ALTITUDE_REVERB_MULTIPLIER_HIGH - 1.0)
+                altitude_decay_mult = 1.0 + factor * (ALTITUDE_DECAY_MULTIPLIER_HIGH - 1.0)
+
+        if distance < REVERB_DISTANCE_START:
+            # Close sounds - minimal reverb
+            target_wet = REVERB_WET_MIN_DB
+            target_decay = REVERB_DECAY_MIN_MS
+        elif distance >= REVERB_DISTANCE_MAX:
+            # Max distance - full reverb
+            target_wet = REVERB_WET_MAX_DB
+            target_decay = REVERB_DECAY_MAX_MS
+        else:
+            # Interpolate based on distance
+            factor = (distance - REVERB_DISTANCE_START) / (REVERB_DISTANCE_MAX - REVERB_DISTANCE_START)
+            # Use sqrt for perceptually linear scaling
+            factor = factor ** 0.7
+            target_wet = REVERB_WET_MIN_DB + factor * (REVERB_WET_MAX_DB - REVERB_WET_MIN_DB)
+            target_decay = REVERB_DECAY_MIN_MS + factor * (REVERB_DECAY_MAX_MS - REVERB_DECAY_MIN_MS)
+
+        # Apply altitude multipliers (shift wet level, scale decay)
+        # For wet level: multiply the offset from min (more reverb at altitude)
+        wet_offset = target_wet - REVERB_WET_MIN_DB
+        target_wet = REVERB_WET_MIN_DB + wet_offset * altitude_wet_mult
+
+        # For decay: directly scale the decay time
+        target_decay = target_decay * altitude_decay_mult
+
+        # Clamp values to reasonable ranges
+        target_wet = max(-40.0, min(-5.0, target_wet))
+        target_decay = max(400, min(4000, target_decay))
+
+        # Smooth interpolation to prevent jarring changes
+        if abs(target_wet - self._current_reverb_wet) > 1.0:
+            if target_wet > self._current_reverb_wet:
+                self._current_reverb_wet = min(target_wet, self._current_reverb_wet + 2.0)
+            else:
+                self._current_reverb_wet = max(target_wet, self._current_reverb_wet - 2.0)
+
+            self._current_reverb_decay = target_decay
+            self.set_reverb(
+                wet_level_db=self._current_reverb_wet,
+                decay_ms=self._current_reverb_decay,
+                enabled=True
+            )
+            self._distance_reverb_enabled = True
+
+            # === LOGGING ===
+            alog = _get_audio_log()
+            alog.reverb(
+                source="distance_reverb",
+                distance=distance,
+                wet_db=self._current_reverb_wet,
+                decay_ms=self._current_reverb_decay
+            )
+
     def set_hull_damage_effect(self, hull_percent):
         """Apply audio effects based on hull damage level.
 
@@ -392,9 +598,16 @@ class MechAudio:
 
         Effects applied:
         - Above 50%: No effects
-        - 25-50%: Light lowpass + minor distortion
-        - Below 25%: Heavy lowpass + significant distortion (critical state)
+        - 25-50%: Light lowpass + minor distortion + compressor
+        - Below 25%: Heavy lowpass + significant distortion + compressor (critical state)
         """
+        # Enable compressor during damage to prevent clipping
+        if hull_percent <= 50:
+            self.set_compressor(threshold_db=-12.0, ratio=4.0, enabled=True,
+                               reason=f"hull_damage_{int(hull_percent)}%")
+        else:
+            self.set_compressor(enabled=False, reason="hull_healthy")
+
         if hull_percent > 50:
             # No damage effects
             self.set_lowpass_filter(22000, enabled=False)
@@ -414,13 +627,14 @@ class MechAudio:
 
     # === Audio Ducking System ===
 
-    def start_ducking(self, groups_to_duck=None, duck_volume=0.3, speed=5.0):
+    def start_ducking(self, groups_to_duck=None, duck_volume=0.3, speed=5.0, reason="unknown"):
         """Start ducking (lowering volume) on specified groups.
 
         Args:
             groups_to_duck: List of group names to duck, or None for all except 'ui'
             duck_volume: Target volume multiplier for ducked groups (0.0-1.0)
             speed: How fast to transition (volume change per second)
+            reason: Reason for ducking (for logging)
 
         Use for important audio events (TTS, critical alerts, weapon impacts).
         """
@@ -433,6 +647,10 @@ class MechAudio:
         self._ducking_speed = speed
         self._ducking_active = True
 
+        # === LOGGING ===
+        alog = _get_audio_log()
+        alog.ducking(reason=reason, duck_volume=duck_volume, speed=speed, is_starting=True)
+
         # OPTIMIZATION: Pre-cache group references to avoid dict lookups each frame
         self._ducked_group_refs = []
         for group_name in groups_to_duck:
@@ -443,15 +661,20 @@ class MechAudio:
                     'base_volume': self.channel_groups[group_name]['base_volume']
                 })
 
-    def stop_ducking(self, speed=3.0):
+    def stop_ducking(self, speed=3.0, reason="restore"):
         """Stop ducking and restore normal volumes.
 
         Args:
             speed: How fast to restore volume (volume change per second)
+            reason: Reason for stopping (for logging)
         """
         self._ducking_target_volume = 1.0
         self._ducking_speed = speed
         # _ducking_active stays true until volumes are restored
+
+        # === LOGGING ===
+        alog = _get_audio_log()
+        alog.ducking(reason=reason, duck_volume=1.0, speed=speed, is_starting=False)
 
     def update_ducking(self, dt):
         """Update ducking volumes (call each frame).
@@ -722,12 +945,10 @@ class MechAudio:
         c = self._get_spatial_constants()
         occlusion = 0.0
 
-        # Head shadow occlusion (sounds behind are partially occluded)
+        # Head shadow occlusion - DISABLED
+        # Directional distinction is handled by panning only, not filtering/volume
         abs_angle = abs(relative_angle)
-        if abs_angle > 120:
-            # Significant occlusion for sounds directly behind
-            rear_occlusion = (abs_angle - 120) / 60.0  # 0 at 120°, 1 at 180°
-            occlusion = max(occlusion, rear_occlusion * 0.6)  # Max 60% occlusion
+        # (Previously applied 60% occlusion for sounds behind - now disabled)
 
         # Altitude-based occlusion (simulates ground/obstacles between)
         # Large altitude differences suggest sound may be partially blocked
@@ -749,16 +970,18 @@ class MechAudio:
         return occlusion, lowpass_cutoff, volume_mult
 
     def apply_directional_filter(self, channel, relative_angle, altitude_diff, distance,
-                                  apply_air_absorption=True, apply_occlusion=True):
+                                  apply_air_absorption=True, apply_occlusion=True,
+                                  channel_id=None, dt=0.016):
         """Apply directional audio filters based on sound source position.
 
         This creates realistic perception of front/behind and above/below positioning
         by applying multiple frequency filtering techniques:
-        - Behind: Lowpass filter (muffled, like head shadowing)
+        - Behind: Lowpass filter (muffled, like head shadowing) - ENHANCED
         - Above: Slight brightness boost (less lowpass)
         - Below: Slight dulling (more lowpass)
         - Distance: Air absorption (highpass, distant sounds lose bass)
         - Occlusion: Additional lowpass and volume reduction for blocked sounds
+        - SMOOTH TRANSITIONS: Interpolates filter changes to prevent jarring audio
 
         Args:
             channel: FMOD channel or FMODChannelWrapper
@@ -768,6 +991,8 @@ class MechAudio:
             distance: Distance to sound source in meters
             apply_air_absorption: If True, apply distance-based air absorption
             apply_occlusion: If True, apply occlusion simulation
+            channel_id: Optional unique ID for smooth transition tracking
+            dt: Delta time in seconds for interpolation (default 16ms)
         """
         if channel is None:
             return
@@ -777,17 +1002,42 @@ class MechAudio:
             if raw_channel is None:
                 return
 
-            # === Directional Lowpass (Head Shadow) ===
+            # Get enhanced audio constants
+            try:
+                from state.constants import (
+                    REAR_LOWPASS_CUTOFF, REAR_LOWPASS_START_ANGLE,
+                    REAR_VOLUME_REDUCTION, OCCLUSION_INTERPOLATION_SPEED
+                )
+                rear_cutoff = REAR_LOWPASS_CUTOFF
+                rear_start_angle = REAR_LOWPASS_START_ANGLE
+                rear_vol_reduction = REAR_VOLUME_REDUCTION
+                interp_speed = OCCLUSION_INTERPOLATION_SPEED
+            except ImportError:
+                rear_cutoff = 2500
+                rear_start_angle = 90
+                rear_vol_reduction = 0.15
+                interp_speed = 8.0
+
+            # === ENHANCED Directional Lowpass (Head Shadow) ===
             abs_angle = abs(relative_angle)
 
             # Calculate lowpass cutoff based on direction
             # Front (0°): 22000 Hz (no filtering)
-            # Side (90°): ~15000 Hz (slight filtering)
-            # Behind (180°): 4000 Hz (significant muffling)
-            if abs_angle <= 90:
+            # Side (90°): ~12000 Hz (slight filtering)
+            # Behind (180°): rear_cutoff Hz (significant muffling - ENHANCED)
+            if abs_angle <= rear_start_angle:
                 rear_factor = 0
             else:
-                rear_factor = (abs_angle - 90) / 90.0
+                # Smooth transition from side to behind
+                rear_factor = (abs_angle - rear_start_angle) / (180.0 - rear_start_angle)
+                # Apply squared curve for more gradual onset
+                rear_factor = rear_factor ** 1.5
+
+            # === ENHANCED Rear Volume Reduction ===
+            # Sounds behind should also be slightly quieter (head shadow)
+            rear_volume_mult = 1.0
+            if abs_angle > rear_start_angle:
+                rear_volume_mult = 1.0 - (rear_factor * rear_vol_reduction)
 
             # === Vertical Positioning ===
             vertical_factor = 0
@@ -814,35 +1064,96 @@ class MechAudio:
 
             # === Combine factors for final lowpass cutoff ===
             combined_factor = max(0, min(1.0, rear_factor + vertical_factor))
-            lowpass_cutoff = 22000 - (combined_factor * 19000)
-            lowpass_cutoff = max(2500, min(22000, lowpass_cutoff))
+            # Use enhanced rear cutoff for behind sounds
+            min_cutoff = rear_cutoff if abs_angle > rear_start_angle else 3000
+            lowpass_cutoff = 22000 - (combined_factor * (22000 - min_cutoff))
+            lowpass_cutoff = max(min_cutoff, min(22000, lowpass_cutoff))
 
-            # Apply lowpass via low_pass_gain (simpler than DSP for per-channel)
-            lowpass_gain = lowpass_cutoff / 22000.0
+            # Calculate target lowpass gain
+            target_lowpass_gain = lowpass_cutoff / 22000.0
+
+            # Calculate target volume multiplier
+            target_volume_mult = rear_volume_mult * occlusion_volume
+
+            # === SMOOTH TRANSITIONS ===
+            # Interpolate filter changes to prevent jarring audio
+            if channel_id is not None:
+                # Get or create state for this channel
+                if channel_id not in self._occlusion_states:
+                    self._occlusion_states[channel_id] = {
+                        'lowpass_gain': target_lowpass_gain,
+                        'volume_mult': target_volume_mult
+                    }
+                state = self._occlusion_states[channel_id]
+
+                # Interpolate toward target
+                current_lowpass = state['lowpass_gain']
+                current_volume = state['volume_mult']
+
+                # Calculate interpolation step (ensure minimum dt for responsiveness)
+                # At 60fps, dt should be ~0.016. If smaller, use minimum to prevent sluggish response.
+                effective_dt = max(dt, 0.016)  # Minimum 16ms (60fps equivalent)
+                interp_step = interp_speed * effective_dt * 0.7  # 0.7x for subtle, natural filtering
+
+                # Smooth interpolation
+                if abs(target_lowpass_gain - current_lowpass) > 0.01:
+                    if target_lowpass_gain > current_lowpass:
+                        state['lowpass_gain'] = min(target_lowpass_gain, current_lowpass + interp_step)
+                    else:
+                        state['lowpass_gain'] = max(target_lowpass_gain, current_lowpass - interp_step)
+                else:
+                    state['lowpass_gain'] = target_lowpass_gain
+
+                if abs(target_volume_mult - current_volume) > 0.01:
+                    if target_volume_mult > current_volume:
+                        state['volume_mult'] = min(target_volume_mult, current_volume + interp_step)
+                    else:
+                        state['volume_mult'] = max(target_volume_mult, current_volume - interp_step)
+                else:
+                    state['volume_mult'] = target_volume_mult
+
+                # Use interpolated values
+                lowpass_gain = state['lowpass_gain']
+                final_volume_mult = state['volume_mult']
+            else:
+                # No channel_id - use direct values (backwards compatibility)
+                lowpass_gain = target_lowpass_gain
+                final_volume_mult = target_volume_mult
+
+            # Apply lowpass via low_pass_gain
             raw_channel.low_pass_gain = lowpass_gain
 
-            # === Air Absorption (Distance-based Highpass) ===
-            # Note: FMOD's per-channel lowpass doesn't have a highpass equivalent,
-            # so we simulate air absorption by further reducing high frequencies
-            # at distance AND slightly reducing volume for distant bass frequencies
+            # === Air Absorption (Distance-based) ===
             c = self._get_spatial_constants()
             if apply_air_absorption and distance > c['air_start']:
                 air_absorption_hz = self.calculate_air_absorption(distance)
                 if air_absorption_hz > 50:
                     # Simulate air absorption via additional lowpass and volume reduction
-                    # Distant sounds lose clarity and presence
                     absorption_factor = air_absorption_hz / c['air_cutoff']
                     # Further reduce the lowpass gain slightly for distant sounds
                     lowpass_gain *= (1.0 - absorption_factor * 0.15)
                     raw_channel.low_pass_gain = max(0.1, lowpass_gain)
 
-            # === Apply Occlusion Volume ===
-            if apply_occlusion and occlusion_volume < 1.0:
+            # === Apply Volume Multiplier ===
+            if final_volume_mult < 1.0:
                 try:
                     current_vol = raw_channel.volume
-                    raw_channel.volume = current_vol * occlusion_volume
+                    raw_channel.volume = current_vol * final_volume_mult
                 except Exception:
                     pass
+
+            # === LOGGING ===
+            alog = _get_audio_log()
+            source_name = channel_id if channel_id else "unknown"
+            is_interpolating = channel_id is not None and channel_id in self._occlusion_states
+            alog.occlusion(
+                source=source_name,
+                angle=relative_angle,
+                lowpass_gain=lowpass_gain,
+                rear_factor=rear_factor,
+                volume_mult=final_volume_mult,
+                is_interpolating=is_interpolating
+            )
 
         except Exception as e:
             logger = _get_logger()
@@ -1128,7 +1439,8 @@ class MechAudio:
         except Exception as e:
             print(f"Failed to load compressed sound '{name}' from {path}: {e}")
 
-    def load_sound_3d(self, path, name, loop=False, min_distance=2.0, max_distance=60.0):
+    def load_sound_3d(self, path, name, loop=False, min_distance=2.0, max_distance=60.0,
+                       use_logarithmic=True):
         """Load a sound file with 3D positioning enabled.
 
         This is a convenience method for loading sounds that will use
@@ -1140,11 +1452,25 @@ class MechAudio:
             loop: If True, sound will loop when played
             min_distance: Distance at which sound is at full volume (meters)
             max_distance: Distance at which sound reaches minimum volume (meters)
+            use_logarithmic: If True (default), use logarithmic/inverse-square rolloff
+                            for more natural distance attenuation. If False, use linear.
 
         Returns:
             The loaded Sound object, or None if loading failed
+
+        Note:
+            Logarithmic rolloff follows the inverse square law where volume halves
+            per doubling of distance - this is how sound behaves in the real world.
+            Linear rolloff provides more predictable behavior but sounds less natural.
         """
-        mode = MODE.CREATESAMPLE | MODE.THREED | MODE.THREED_LINEARROLLOFF
+        # Use logarithmic (inverse square) rolloff for natural sound falloff
+        # This is more realistic than linear - sound halves per doubling of distance
+        if use_logarithmic:
+            # THREED_INVERSEROLLOFF uses inverse square law (1/distance^2)
+            mode = MODE.CREATESAMPLE | MODE.THREED | MODE.THREED_INVERSEROLLOFF
+        else:
+            mode = MODE.CREATESAMPLE | MODE.THREED | MODE.THREED_LINEARROLLOFF
+
         if loop:
             mode |= MODE.LOOP_NORMAL
         else:
@@ -1154,6 +1480,9 @@ class MechAudio:
             sound = self.system.create_sound(path, mode)
             if sound:
                 # Set 3D distance parameters
+                # For logarithmic rolloff:
+                # - min_distance: sound is at full volume
+                # - max_distance: sound reaches minimum audible level
                 sound.min_distance = min_distance
                 sound.max_distance = max_distance
                 self.sounds[name] = sound
@@ -1229,7 +1558,8 @@ class MechAudio:
             print(f"Failed to play sound '{sound_name}': {e}")
             return None
 
-    def play_sound_object(self, sound, group_name=None, loop_count=0, paused=False):
+    def play_sound_object(self, sound, group_name=None, loop_count=0, paused=False,
+                          position_3d=None, velocity=None):
         """Play a Sound object directly (useful for sound lists like thrusters).
 
         Args:
@@ -1237,6 +1567,8 @@ class MechAudio:
             group_name: Optional channel group name for volume control
             loop_count: Number of loops (-1 for infinite, 0 for one-shot)
             paused: If True, start paused
+            position_3d: Optional (x, y, z) position for 3D spatialization
+            velocity: Optional (vx, vy, vz) velocity for Doppler effect
 
         Returns:
             The Channel object for controlling playback, or None if failed
@@ -1246,9 +1578,19 @@ class MechAudio:
             group = self.channel_groups[group_name]['group']
 
         try:
-            channel = self.system.play_sound(sound, group, paused)
+            # Start paused if we need to set 3D position before playing
+            start_paused = paused or (position_3d is not None)
+            channel = self.system.play_sound(sound, group, start_paused)
             if loop_count != 0:
                 channel.loop_count = loop_count
+
+            # Set 3D position if provided
+            if position_3d is not None:
+                self.set_channel_3d_attributes(channel, position_3d, velocity)
+                # Unpause if we only paused for positioning
+                if not paused:
+                    channel.paused = False
+
             return channel
         except Exception as e:
             print(f"Failed to play sound object: {e}")
@@ -1430,7 +1772,8 @@ class MechAudio:
 
         # Release DSP effects
         highpass_dsp = getattr(self, '_highpass_dsp', None)
-        for dsp in [self._reverb_dsp, self._lowpass_dsp, self._distortion_dsp, highpass_dsp]:
+        compressor_dsp = getattr(self, '_compressor_dsp', None)
+        for dsp in [self._reverb_dsp, self._lowpass_dsp, self._distortion_dsp, highpass_dsp, compressor_dsp]:
             if dsp:
                 try:
                     dsp.release()
@@ -1440,6 +1783,10 @@ class MechAudio:
         self._lowpass_dsp = None
         self._distortion_dsp = None
         self._highpass_dsp = None
+        self._compressor_dsp = None
+
+        # Clear occlusion states
+        self._occlusion_states.clear()
 
         for name, dsp in self.dsp_effects.items():
             try:
@@ -1526,8 +1873,9 @@ class FMODChannelWrapper:
         self._fade_rate = 0.0  # Volume change per second
         self._pending_sound = None  # Sound waiting to play after fade out
         self._pending_params = {}  # Parameters for pending sound
+        self._stop_after_fade = False  # Stop channel after fade out completes
 
-    def play(self, sound, loops=0, mono_downmix=False, position_3d=None):
+    def play(self, sound, loops=0, mono_downmix=False, position_3d=None, velocity=None):
         """Play a sound on this channel.
 
         Args:
@@ -1535,6 +1883,7 @@ class FMODChannelWrapper:
             loops: Number of loops (-1 for infinite, 0 for one-shot)
             mono_downmix: If True, downmix stereo to mono for proper 3D positioning
             position_3d: Optional (x, y, z) tuple for 3D sounds - sets position before playing
+            velocity: Optional (vx, vy, vz) tuple for Doppler effect
 
         Returns:
             self for chaining
@@ -1556,10 +1905,10 @@ class FMODChannelWrapper:
         self._mono_downmix = mono_downmix
 
         if self._channel:
-            # For 3D sounds with position, set position before unpausing
+            # For 3D sounds with position, set position (and velocity) before unpausing
             if position_3d is not None:
                 self._position_3d = list(position_3d)
-                self.audio.set_channel_3d_attributes(self._channel, position_3d)
+                self.audio.set_channel_3d_attributes(self._channel, position_3d, velocity)
                 # Unpause after setting position
                 if start_paused:
                     try:
@@ -1645,6 +1994,59 @@ class FMODChannelWrapper:
 
         return self
 
+    def play_with_fade_in(self, sound, fade_in_ms=150, loops=0,
+                          mono_downmix=False, position_3d=None):
+        """Play a sound with a fade-in effect.
+
+        Starts the sound at 0 volume and fades up to full volume.
+
+        Args:
+            sound: Sound object or name to play
+            fade_in_ms: Milliseconds to fade in (default 150ms)
+            loops: Number of loops (-1 for infinite)
+            mono_downmix: If True, downmix stereo to mono
+            position_3d: Optional 3D position tuple
+
+        Returns:
+            self for chaining
+        """
+        # Play the sound (this will stop any current sound)
+        self.play(sound, loops, mono_downmix, position_3d)
+
+        if self._channel:
+            # Start fade in from 0
+            self._fade_state = 'fading_in'
+            self._fade_volume = 0.0
+            self._fade_target = 1.0
+            self._fade_rate = 1000.0 / max(1, fade_in_ms)
+            self._apply_fade_volume()
+
+        return self
+
+    def fade_out(self, fade_out_ms=200, stop_when_done=True):
+        """Fade out the current sound.
+
+        Args:
+            fade_out_ms: Milliseconds to fade out (default 200ms)
+            stop_when_done: If True, stop the channel when fade completes
+
+        Returns:
+            self for chaining
+        """
+        if not self.get_busy():
+            return self
+
+        self._fade_state = 'fading_out'
+        self._fade_volume = self._fade_volume if self._fade_volume < 1.0 else 1.0
+        self._fade_target = 0.0
+        self._fade_rate = 1000.0 / max(1, fade_out_ms)
+        self._stop_after_fade = stop_when_done
+        # Clear pending sound so fade_out just stops
+        self._pending_sound = None
+        self._pending_params = {}
+
+        return self
+
     def update_fade(self, dt):
         """Update crossfade state. Must be called each frame when crossfading.
 
@@ -1679,7 +2081,7 @@ class FMODChannelWrapper:
                             })
                     self._channel = None
 
-                # Play pending sound if we have one
+                # Play pending sound if we have one (crossfade case)
                 if self._pending_sound is not None:
                     self.play(
                         self._pending_sound,
@@ -1701,11 +2103,14 @@ class FMODChannelWrapper:
                         'fade_in_ms': fade_in_ms
                     })
                 else:
+                    # Simple fade out (no pending sound)
                     self._fade_state = 'none'
+                    self._fade_volume = 1.0  # Reset for next play
 
-                # Clear pending
+                # Clear pending and stop flag
                 self._pending_sound = None
                 self._pending_params = {}
+                self._stop_after_fade = False
 
         elif self._fade_state == 'fading_in':
             # Increase volume
@@ -1862,6 +2267,36 @@ class FMODChannelWrapper:
     def is_playing(self):
         """Check if channel is playing (property version)."""
         return self.get_busy()
+
+    def set_pitch(self, pitch):
+        """Set the playback pitch for this channel.
+
+        Args:
+            pitch: Pitch multiplier (1.0 = normal, 2.0 = octave up, 0.5 = octave down)
+                   Typical range: 0.5 to 2.0 for natural-sounding variation
+        """
+        if self._channel is None:
+            return
+
+        if not self.is_valid():
+            return
+
+        try:
+            # Clamp pitch to reasonable range
+            pitch = max(0.5, min(2.0, pitch))
+            self._channel.pitch = pitch
+        except Exception:
+            pass  # Channel may be invalid
+
+    def get_pitch(self):
+        """Get the current playback pitch."""
+        if self._channel is None:
+            return 1.0
+
+        try:
+            return self._channel.pitch
+        except Exception:
+            return 1.0
 
     def set_3d_position(self, x, y, z=0, velocity=None):
         """Set 3D position for this channel (for 3D sounds).
