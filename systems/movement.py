@@ -18,6 +18,10 @@ from utils.helpers import get_cardinal_direction, normalize_angle
 class MovementSystem:
     """Manages player movement, footsteps, and rotation."""
 
+    # Foot positioning constants (meters)
+    FOOT_SIDE_OFFSET = 0.4   # Distance from center to each foot (left/right)
+    FOOT_FORWARD_OFFSET = 0.3  # Forward offset during step
+
     def __init__(self, audio_manager, sound_loader, tts, game_state):
         """Initialize the movement system.
 
@@ -176,6 +180,35 @@ class MovementSystem:
 
         return walking
 
+    def _get_foot_position(self, is_left_foot: bool) -> tuple:
+        """Get 3D position for a footstep sound.
+
+        Calculates position based on player location, facing angle, and which foot.
+
+        Args:
+            is_left_foot: True for left foot, False for right foot
+
+        Returns:
+            (x, y, z) tuple in game coordinates (z at ground level)
+        """
+        facing_rad = math.radians(self.state.facing_angle)
+
+        # Side offset: negative for left foot, positive for right foot
+        side_offset = -self.FOOT_SIDE_OFFSET if is_left_foot else self.FOOT_SIDE_OFFSET
+
+        # Calculate foot position relative to player center
+        # Forward direction: sin(facing) for X, cos(facing) for Y
+        # Side direction (perpendicular): cos(facing) for X, -sin(facing) for Y
+        foot_x = (self.state.player_x +
+                  math.sin(facing_rad) * self.FOOT_FORWARD_OFFSET +
+                  math.cos(facing_rad) * side_offset)
+        foot_y = (self.state.player_y +
+                  math.cos(facing_rad) * self.FOOT_FORWARD_OFFSET -
+                  math.sin(facing_rad) * side_offset)
+
+        # Footsteps are at ground level (z = 0)
+        return (foot_x, foot_y, 0.0)
+
     def _play_footstep(self, current_time: int, reveal_callback=None):
         """Play a footstep sound and handle debris collection.
 
@@ -188,7 +221,9 @@ class MovementSystem:
 
         sound = self.sounds.get_random_footstep(is_left_foot)
         if sound:
-            self.audio.play_sound_object(sound, 'movement')
+            # Play footstep at actual foot position in 3D space
+            foot_pos = self._get_foot_position(is_left_foot)
+            self.audio.play_sound_object(sound, 'movement', position_3d=foot_pos)
             print(f"STEP: {'left' if is_left_foot else 'right'}")
 
         self.state.last_step_time = current_time
@@ -214,14 +249,21 @@ class MovementSystem:
                 print("Debris inventory full!")
 
     def play_landing_footsteps(self):
-        """Play both footsteps simultaneously for landing."""
+        """Play both footsteps simultaneously for landing with 3D positioning."""
         left_sound = self.sounds.get_random_footstep(True)
         right_sound = self.sounds.get_random_footstep(False)
 
+        # Get positions for both feet (no forward offset for landing - feet together)
+        facing_rad = math.radians(self.state.facing_angle)
+        left_x = self.state.player_x - math.cos(facing_rad) * self.FOOT_SIDE_OFFSET
+        left_y = self.state.player_y + math.sin(facing_rad) * self.FOOT_SIDE_OFFSET
+        right_x = self.state.player_x + math.cos(facing_rad) * self.FOOT_SIDE_OFFSET
+        right_y = self.state.player_y - math.sin(facing_rad) * self.FOOT_SIDE_OFFSET
+
         if left_sound:
-            self.audio.play_sound_object(left_sound, 'movement')
+            self.audio.play_sound_object(left_sound, 'movement', position_3d=(left_x, left_y, 0.0))
         if right_sound:
-            self.audio.play_sound_object(right_sound, 'movement')
+            self.audio.play_sound_object(right_sound, 'movement', position_3d=(right_x, right_y, 0.0))
 
     def check_rotation_transitions(self):
         """Check for rotation sound state transitions."""

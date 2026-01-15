@@ -166,6 +166,11 @@ class WeaponSystem:
             ammo_consumed = CHAINGUN_CONSUMPTION_RATE * dt
             self.state.ammo[WEAPON_CHAINGUN] = max(0, self.state.ammo[WEAPON_CHAINGUN] - ammo_consumed)
 
+            # Trigger drone sound reactions (throttled to every 500ms, not every frame)
+            if current_time - getattr(self, '_last_chaingun_reaction', 0) >= 500:
+                self._last_chaingun_reaction = current_time
+                self.drones.react_to_player_fire(current_time)
+
             # Hit drones in arc
             if random.random() < CHAINGUN_HIT_CHANCE:
                 targets = self.drones.get_drones_in_range(CHAINGUN_RANGE, CHAINGUN_ARC)
@@ -312,6 +317,9 @@ class WeaponSystem:
         self.tts.speak("Missiles away")
         print(f"Missiles: Launching! (Ammo: {self.state.ammo[WEAPON_MISSILES]})")
 
+        # Trigger drone sound reactions to player firing
+        self.drones.react_to_player_fire(current_time)
+
         if reveal_callback:
             reveal_callback(current_time)
 
@@ -343,6 +351,9 @@ class WeaponSystem:
                     if reveal_callback:
                         reveal_callback(current_time)
 
+                    # Trigger drone sound reactions to player firing
+                    self.drones.react_to_player_fire(current_time)
+
                     # Hit closest drone in tight arc
                     targets = self.drones.get_drones_in_range(BLASTER_RANGE, BLASTER_ARC)
                     if targets:
@@ -368,6 +379,9 @@ class WeaponSystem:
                     print(f"EMP: Fired! (Charges: {self.state.ammo[WEAPON_EMP]})")
                     if reveal_callback:
                         reveal_callback(current_time)
+
+                    # Trigger drone sound reactions to player firing
+                    self.drones.react_to_player_fire(current_time)
 
                     # Damage all drones in range
                     targets = self.drones.get_drones_in_range(EMP_RANGE)

@@ -29,13 +29,14 @@ class ThrusterSystem:
         self.tts = tts
         self.state = game_state
 
-    def update(self, keys, dt: float, current_time: int, reveal_callback=None) -> dict:
+    def update(self, keys, dt: float, current_time: int, space_pressed: bool = False, reveal_callback=None) -> dict:
         """Update thruster system.
 
         Args:
             keys: Pygame key state
             dt: Delta time in seconds
             current_time: Current game time in milliseconds
+            space_pressed: True if spacebar was just pressed this frame (for toggle)
             reveal_callback: Optional callback to reveal camo'd player
 
         Returns:
@@ -54,6 +55,15 @@ class ThrusterSystem:
             if self.state.thruster_state == 'active':
                 self._force_shutdown()
         else:
+            # Spacebar toggles thrusters on/off
+            if space_pressed:
+                if self.state.thruster_state == 'idle' and self.state.thruster_energy > 0:
+                    self._activate_thrusters(w_pressed)
+                elif self.state.thruster_state == 'active':
+                    self._deactivate_thrusters(depleted=False)
+                    self.tts.speak("Thrusters off")
+                    print("Thrusters: Deactivated")
+
             # Determine flight mode
             was_forward_flight = self.state.forward_flight_mode
             self.state.forward_flight_mode = w_pressed and self.state.thruster_state == 'active'
@@ -67,18 +77,14 @@ class ThrusterSystem:
                     self.tts.speak("Hovering")
                     print("Flight: Hovering")
 
-            # Determine thrust direction
+            # Determine thrust direction (Page Up/Down only adjust thrust, don't activate)
             thrust_direction = 0
             if page_up and not page_down:
                 thrust_direction = 1
             elif page_down and not page_up:
                 thrust_direction = -1
 
-            # Handle thruster activation
-            if thrust_direction == 1 and self.state.thruster_state == 'idle' and self.state.thruster_energy > 0:
-                self._activate_thrusters(w_pressed)
-
-            # Update thrust level
+            # Update thrust level (only when thrusters are active)
             if self.state.thruster_state == 'active' and self.state.thruster_energy > 0:
                 self._update_thrust(thrust_direction, dt, current_time, reveal_callback)
 
@@ -95,23 +101,41 @@ class ThrusterSystem:
 
         return result
 
+    def _get_thruster_position(self):
+        """Get 3D position for thruster sounds (below mech's feet).
+
+        Returns:
+            (x, y, z) tuple in game coordinates with z in meters
+        """
+        # Position thrusters 2 meters below the mech
+        # Convert altitude from feet to meters for audio positioning
+        altitude_meters = self.state.player_altitude / 3.28
+        thruster_z = max(0, altitude_meters - 2.0)  # 2m below, but not underground
+        return (self.state.player_x, self.state.player_y, thruster_z)
+
     def _activate_thrusters(self, w_pressed: bool):
         """Activate thrusters."""
         self.state.thruster_state = 'active'
         self.state.forward_flight_mode = w_pressed
         self.state.thrust_level = 0.02  # Start at 2%
 
-        # Play activation sound
+        # Get thruster position (below mech)
+        thruster_pos = self._get_thruster_position()
+
+        # Play activation sound at thruster position
         channel = self.audio.play_sound('thruster_activate', 'thrusters')
         self.audio.set_channel('thruster_activate', channel)
 
-        # Start thruster pitch sound
+        # Start thruster pitch sound at position below mech
         thruster_sounds = self.sounds.sounds.get('thrusters', [])
         if thruster_sounds:
             pitch_idx = int(self.state.thrust_level * (NUM_PITCH_STAGES - 1))
             pitch_idx = max(0, min(pitch_idx, len(thruster_sounds) - 1))
             sound = thruster_sounds[pitch_idx]
-            channel = self.audio.play_sound_object(sound, 'thrusters', loop_count=-1)
+            channel = self.audio.play_sound_object(
+                sound, 'thrusters', loop_count=-1,
+                position_3d=thruster_pos
+            )
             self.audio.set_channel('thruster_pitch', channel)
             self.state.current_pitch_index = pitch_idx
 
@@ -127,6 +151,9 @@ class ThrusterSystem:
         self.state.forward_flight_mode = False
         self.state.boost_active = False
 
+    # Minimum thrust level when active (keeps sound playing, only spacebar turns off)
+    MIN_THRUST_LEVEL = 0.02  # 2% minimum
+
     def _update_thrust(self, thrust_direction: int, dt: float, current_time: int, reveal_callback):
         """Update thrust level and related systems."""
         old_thrust = self.state.thrust_level
@@ -134,19 +161,18 @@ class ThrusterSystem:
         if thrust_direction == 1:
             self.state.thrust_level = min(1.0, self.state.thrust_level + THRUST_RATE * dt)
         elif thrust_direction == -1:
-            self.state.thrust_level = max(0.0, self.state.thrust_level - THRUST_RATE * dt)
+            # Page Down reduces thrust but not below minimum (only spacebar turns off)
+            self.state.thrust_level = max(self.MIN_THRUST_LEVEL, self.state.thrust_level - THRUST_RATE * dt)
 
         # Thrusters above 10% reveal camo'd player
         if self.state.thrust_level > 0.10 and reveal_callback:
             reveal_callback(current_time)
 
-        # Check for thrust cutoff
-        if self.state.thrust_level <= 0:
-            self._deactivate_thrusters(depleted=False)
-            return
-
         # Update pitch sound
         self._update_pitch_sound()
+
+        # Update 3D position as mech moves
+        self._update_thruster_3d_position()
 
         # Announce thrust milestones
         self._announce_thrust_milestones()
@@ -204,9 +230,21 @@ class ThrusterSystem:
         if new_pitch_index != self.state.current_pitch_index:
             self.audio.stop_channel('thruster_pitch')
             sound = thruster_sounds[new_pitch_index]
-            channel = self.audio.play_sound_object(sound, 'thrusters', loop_count=-1)
+            # Play at thruster position (below mech)
+            thruster_pos = self._get_thruster_position()
+            channel = self.audio.play_sound_object(
+                sound, 'thrusters', loop_count=-1,
+                position_3d=thruster_pos
+            )
             self.audio.set_channel('thruster_pitch', channel)
             self.state.current_pitch_index = new_pitch_index
+
+    def _update_thruster_3d_position(self):
+        """Update 3D position of active thruster sound as mech moves."""
+        channel = self.audio.get_channel('thruster_pitch')
+        if channel and hasattr(channel, 'set_3d_position'):
+            thruster_pos = self._get_thruster_position()
+            channel.set_3d_position(*thruster_pos)
 
     def _announce_thrust_milestones(self):
         """Announce thrust milestones (25%, 50%, 75%, 100%)."""

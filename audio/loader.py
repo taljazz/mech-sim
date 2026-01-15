@@ -88,7 +88,8 @@ class SoundLoader:
             self._pack = None
         self._use_pack = False
 
-    def _load_from_pack(self, rel_path: str, name: str, loop: bool = False, is_3d: bool = False, compressed: bool = False):
+    def _load_from_pack(self, rel_path: str, name: str, loop: bool = False, is_3d: bool = False,
+                        compressed: bool = False, min_distance: float = 2.0, max_distance: float = 60.0):
         """Load a sound from the encrypted pack into FMOD memory.
 
         Args:
@@ -97,6 +98,8 @@ class SoundLoader:
             loop: Whether to loop
             is_3d: Whether to use 3D spatialization
             compressed: Whether to use compressed sample mode
+            min_distance: Distance where sound is at full volume (3D only)
+            max_distance: Distance where sound is at minimum volume (3D only)
 
         Returns:
             Sound object or None
@@ -138,8 +141,8 @@ class SoundLoader:
 
             # Set 3D distance parameters for 3D sounds
             if is_3d:
-                sound.min_distance = 2.0
-                sound.max_distance = 60.0
+                sound.min_distance = min_distance
+                sound.max_distance = max_distance
 
             # Store in FMOD's sound dict
             self.audio.fmod.sounds[name] = sound
@@ -149,7 +152,8 @@ class SoundLoader:
             print(f"Failed to load sound '{name}' from pack: {e}")
             return None
 
-    def _load_sound(self, rel_path: str, name: str, loop: bool = False, is_3d: bool = False, compressed: bool = False):
+    def _load_sound(self, rel_path: str, name: str, loop: bool = False, is_3d: bool = False,
+                    compressed: bool = False, min_distance: float = 2.0, max_distance: float = 60.0):
         """Load a sound from pack or disk.
 
         Args:
@@ -158,17 +162,20 @@ class SoundLoader:
             loop: Whether to loop
             is_3d: Whether to use 3D spatialization
             compressed: Whether to use compressed sample mode
+            min_distance: Distance where sound is at full volume (3D only)
+            max_distance: Distance where sound is at minimum volume (3D only)
 
         Returns:
             Sound object or None
         """
         if self._use_pack:
-            return self._load_from_pack(rel_path, name, loop, is_3d, compressed)
+            return self._load_from_pack(rel_path, name, loop, is_3d, compressed, min_distance, max_distance)
         else:
             # Load from disk using existing methods
             full_path = os.path.join(self._sounds_base_path, rel_path)
             if is_3d:
-                return self.audio.load_sound_3d(full_path, name, is_3d=True)
+                return self.audio.load_sound_3d(full_path, name, is_3d=True,
+                                                min_distance=min_distance, max_distance=max_distance)
             elif compressed:
                 return self.audio.load_sound_compressed(full_path, name, loop=loop)
             else:
@@ -476,27 +483,31 @@ class SoundLoader:
         all_files = self._pack.list_files()
         drone_files = sorted([f for f in all_files if f.startswith('Drones/')])
 
-        def load_from_subdir(subdir: str, key: str, is_3d: bool = True):
+        def load_from_subdir(subdir: str, key: str, is_3d: bool = True,
+                            min_dist: float = 2.0, max_dist: float = 60.0):
             """Load sounds from a subdirectory in pack."""
             prefix = f'Drones/{subdir}/'
             files = sorted([f for f in drone_files if f.startswith(prefix) and f.endswith('.wav')])
             sounds = []
             for i, rel_path in enumerate(files):
-                sound = self._load_sound(rel_path, f'drone_{key}_{i}', is_3d=is_3d)
+                sound = self._load_sound(rel_path, f'drone_{key}_{i}', is_3d=is_3d,
+                                        min_distance=min_dist, max_distance=max_dist)
                 if sound:
                     sounds.append(sound)
             self.sounds['drones'][key] = sounds
             if sounds:
                 print(f"  Loaded {len(sounds)} {key} drone sounds from pack" + (" (3D)" if is_3d else ""))
 
-        # Load all drone sound categories
+        # Load all drone sound categories with appropriate distance settings
+        # Ambient/movement sounds: larger max distance for gradual volume changes
+        # Drones spawn at 30-50m, so max_distance=100 gives better attenuation curve
         load_from_subdir('Ambience', 'ambience')
-        load_from_subdir('Beacons', 'beacons')
-        load_from_subdir('Scans', 'scans')
-        load_from_subdir('PassBys', 'passbys')
-        load_from_subdir('SuperSonics', 'supersonics')
-        load_from_subdir('SonicBooms', 'sonicbooms')
-        load_from_subdir('Takeoffs', 'takeoffs')
+        load_from_subdir('Beacons', 'beacons', max_dist=80.0)
+        load_from_subdir('Scans', 'scans', max_dist=80.0)
+        load_from_subdir('PassBys', 'passbys', min_dist=3.0, max_dist=100.0)
+        load_from_subdir('SuperSonics', 'supersonics', min_dist=3.0, max_dist=100.0)
+        load_from_subdir('SonicBooms', 'sonicbooms', min_dist=5.0, max_dist=120.0)
+        load_from_subdir('Takeoffs', 'takeoffs', min_dist=3.0, max_dist=100.0)
         load_from_subdir('Hits', 'hits')
         load_from_subdir('Debris', 'debris')
         load_from_subdir('Weapons', 'weapons')
@@ -555,7 +566,8 @@ class SoundLoader:
         """Load drone sounds from filesystem."""
         drone_dir = self._drone_dir
 
-        def load_from_subdir(subdir: str, key: str, is_3d: bool = True):
+        def load_from_subdir(subdir: str, key: str, is_3d: bool = True,
+                            min_dist: float = 2.0, max_dist: float = 60.0):
             """Load sounds from a subdirectory."""
             path = os.path.join(drone_dir, subdir)
             if os.path.exists(path):
@@ -563,7 +575,8 @@ class SoundLoader:
                 sounds = []
                 for i, filename in enumerate(files):
                     rel_path = f'Drones/{subdir}/{filename}'
-                    sound = self._load_sound(rel_path, f'drone_{key}_{i}', is_3d=is_3d)
+                    sound = self._load_sound(rel_path, f'drone_{key}_{i}', is_3d=is_3d,
+                                            min_distance=min_dist, max_distance=max_dist)
                     if sound:
                         sounds.append(sound)
                 self.sounds['drones'][key] = sounds
@@ -571,14 +584,14 @@ class SoundLoader:
             else:
                 self.sounds['drones'][key] = []
 
-        # Load all drone sound categories
+        # Load all drone sound categories with appropriate distance settings
         load_from_subdir('Ambience', 'ambience')
-        load_from_subdir('Beacons', 'beacons')
-        load_from_subdir('Scans', 'scans')
-        load_from_subdir('PassBys', 'passbys')
-        load_from_subdir('SuperSonics', 'supersonics')
-        load_from_subdir('SonicBooms', 'sonicbooms')
-        load_from_subdir('Takeoffs', 'takeoffs')
+        load_from_subdir('Beacons', 'beacons', max_dist=80.0)
+        load_from_subdir('Scans', 'scans', max_dist=80.0)
+        load_from_subdir('PassBys', 'passbys', min_dist=3.0, max_dist=100.0)
+        load_from_subdir('SuperSonics', 'supersonics', min_dist=3.0, max_dist=100.0)
+        load_from_subdir('SonicBooms', 'sonicbooms', min_dist=5.0, max_dist=120.0)
+        load_from_subdir('Takeoffs', 'takeoffs', min_dist=3.0, max_dist=100.0)
         load_from_subdir('Hits', 'hits')
         load_from_subdir('Debris', 'debris')
         load_from_subdir('Weapons', 'weapons')

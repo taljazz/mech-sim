@@ -184,18 +184,24 @@ class AudioManager:
         """
         return self._fmod.play_sound(name, group, loop_count=loop_count)
 
-    def play_sound_object(self, sound, group: str, loop_count: int = 0):
+    def play_sound_object(self, sound, group: str, loop_count: int = 0,
+                          position_3d: tuple = None, velocity: tuple = None):
         """Play a sound object directly.
 
         Args:
             sound: Sound object
             group: Channel group name
             loop_count: Number of loops (-1 for infinite)
+            position_3d: Optional (x, y, z) position for 3D spatialization
+            velocity: Optional (vx, vy, vz) velocity for Doppler effect
 
         Returns:
             The channel playing the sound
         """
-        return self._fmod.play_sound_object(sound, group, loop_count=loop_count)
+        return self._fmod.play_sound_object(
+            sound, group, loop_count=loop_count,
+            position_3d=position_3d, velocity=velocity
+        )
 
     def set_channel(self, name: str, channel):
         """Track a channel by name.
@@ -365,13 +371,15 @@ class AudioManager:
         self._fmod.set_sound_3d_min_max_distance(sound, min_distance, max_distance)
 
     def apply_directional_filter(self, channel, relative_angle, altitude_diff, distance,
-                                   apply_air_absorption=True, apply_occlusion=True):
+                                   apply_air_absorption=True, apply_occlusion=True,
+                                   channel_id=None, dt=0.016):
         """Apply directional audio filter to a channel.
 
         Creates perception of front/behind and above/below through frequency filtering:
-        - Behind: Muffled (lowpass) due to head shadowing
+        - Behind: Muffled (lowpass) due to head shadowing - ENHANCED
         - Above: Brighter (less lowpass)
         - Below: Duller (more lowpass)
+        - SMOOTH TRANSITIONS: Interpolates changes to prevent jarring audio
 
         Args:
             channel: FMODChannelWrapper or raw channel
@@ -380,11 +388,15 @@ class AudioManager:
             distance: Distance in meters
             apply_air_absorption: If True, apply distance-based air absorption
             apply_occlusion: If True, apply occlusion simulation
+            channel_id: Optional unique ID for smooth transition tracking
+            dt: Delta time in seconds for interpolation
         """
         self._fmod.apply_directional_filter(
             channel, relative_angle, altitude_diff, distance,
             apply_air_absorption=apply_air_absorption,
-            apply_occlusion=apply_occlusion
+            apply_occlusion=apply_occlusion,
+            channel_id=channel_id,
+            dt=dt
         )
 
     def calculate_directional_params(self, source_x, source_y, source_altitude,

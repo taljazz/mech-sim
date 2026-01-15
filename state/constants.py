@@ -258,13 +258,113 @@ BASE_VOLUMES = {
 # =============================================================================
 # STATE TIMINGS
 # =============================================================================
-DRONE_SPAWN_STATE_DURATION = 2000
-DRONE_DETECT_STATE_DURATION = 1000  # Reduced from 1500 - faster target acquisition
-DRONE_ATTACK_STATE_DURATION = 200   # Reduced from 500 - rapid fire
+# State duration ranges (randomized per state entry)
+DRONE_SPAWN_DURATION_MIN = 1500
+DRONE_SPAWN_DURATION_MAX = 2500
+DRONE_DETECT_DURATION_MIN = 800
+DRONE_DETECT_DURATION_MAX = 1500
+DRONE_ATTACK_DURATION_MIN = 150
+DRONE_ATTACK_DURATION_MAX = 300
 # Dynamic cooldown between bursts (spread out for realism)
 DRONE_COOLDOWN_MIN = 800   # Minimum time between bursts
 DRONE_COOLDOWN_MAX = 2000  # Maximum time between bursts
-DRONE_SEARCH_TIMEOUT = 8000
+DRONE_SEARCH_TIMEOUT = 8000  # Legacy (use MIN/MAX instead)
+DRONE_SEARCH_TIMEOUT_MIN = 6000
+DRONE_SEARCH_TIMEOUT_MAX = 10000
+
+# Legacy fixed durations (for reference, replaced by ranges above)
+DRONE_SPAWN_STATE_DURATION = 2000
+DRONE_DETECT_STATE_DURATION = 1000
+DRONE_ATTACK_STATE_DURATION = 200
+
+# =============================================================================
+# DRONE AI PERSONALITIES
+# =============================================================================
+DRONE_PERSONALITIES = {
+    'rookie': {
+        'speed_mult': 0.8,
+        'accuracy_mult': 0.7,
+        'aggression': 0.3,
+        'evasion_skill': 0.6,
+        'hesitation_chance': 0.25,  # More likely to hesitate
+    },
+    'veteran': {
+        'speed_mult': 1.0,
+        'accuracy_mult': 1.0,
+        'aggression': 0.5,
+        'evasion_skill': 1.0,
+        'hesitation_chance': 0.10,
+    },
+    'ace': {
+        'speed_mult': 1.2,
+        'accuracy_mult': 1.2,
+        'aggression': 0.7,
+        'evasion_skill': 1.3,
+        'hesitation_chance': 0.05,  # Rarely hesitates
+    },
+    'berserker': {
+        'speed_mult': 1.3,
+        'accuracy_mult': 0.8,
+        'aggression': 0.9,
+        'evasion_skill': 0.5,  # Reckless, doesn't evade well
+        'hesitation_chance': 0.0,  # Never hesitates
+    }
+}
+
+# Personality spawn weights (higher = more common)
+DRONE_PERSONALITY_WEIGHTS = {
+    'rookie': 30,
+    'veteran': 45,
+    'ace': 15,
+    'berserker': 10
+}
+
+# =============================================================================
+# DRONE EVASION SETTINGS
+# =============================================================================
+EVASION_INTERVAL_MIN = 0.3   # Seconds before direction change (was fixed 0.5)
+EVASION_INTERVAL_MAX = 0.7
+EVASION_ANGLE_VARIANCE = 30  # Degrees - evasion not purely perpendicular
+
+# =============================================================================
+# DRONE STATE TRANSITIONS (Probabilistic)
+# =============================================================================
+HESITATION_CHANCE = 0.15      # Base chance to hesitate before engaging
+FALSE_START_CHANCE = 0.10     # Chance to abort detection and return to patrol
+COOLDOWN_REASSESS_CHANCE = 0.15  # Chance to extend cooldown
+COOLDOWN_PEEK_INTERVAL = 300  # ms - how often to check player during cooldown
+
+# =============================================================================
+# DRONE SEARCH PATTERNS
+# =============================================================================
+SEARCH_PATTERN_TYPES = ['spiral', 'zigzag', 'wander']
+SEARCH_SPIRAL_EXPANSION = 5   # Meters per revolution
+SEARCH_ZIGZAG_WIDTH = 10      # Meters side-to-side
+SEARCH_WANDER_DISTANCE = 8    # Meters per waypoint
+
+# =============================================================================
+# DRONE COORDINATION / FLANKING
+# =============================================================================
+FLANK_SEPARATION_MIN = 90     # Degrees between drones
+FLANK_SEPARATION_MAX = 120
+FLANK_CIRCLE_SPEED = 20       # Degrees per second when circling
+FLANK_DISTANCE_MIN = 15       # Meters
+FLANK_DISTANCE_MAX = 25
+CROSSFIRE_WINDOW = 500        # ms - attacks within this window count as coordinated
+
+# =============================================================================
+# DRONE ATTACK ADAPTATION
+# =============================================================================
+ATTACK_FRUSTRATION_THRESHOLD = 0.2  # Hit rate below this = frustrated
+ATTACK_BREAK_OFF_CHANCE = 0.5       # Chance to break off when frustrated
+ATTACK_MIN_SHOTS_BEFORE_ADAPT = 4   # Minimum shots before considering break-off
+
+# =============================================================================
+# DRONE SOUND REACTIONS
+# =============================================================================
+SOUND_REACTION_RANGE = 50     # Meters - drones within this react to player fire
+SOUND_REACTION_DODGE_CHANCE = 0.7   # Chance to dodge vs advance
+SOUND_REACTION_COOLDOWN = 1000      # ms - minimum time between reactions
 
 # =============================================================================
 # LANDING

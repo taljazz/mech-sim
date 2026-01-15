@@ -18,6 +18,7 @@ from audio.manager import AudioManager
 from audio.loader import SoundLoader
 from audio.drone_pool import DroneAudioPool
 from audio.logging import AudioLogger
+from audio.audio_logger import audio_log, set_audio_logging, set_log_detail
 from ui.tts import TTSManager
 from ui.menu import ConfigMenu
 from systems.movement import MovementSystem
@@ -101,6 +102,13 @@ class Game:
         # Audio debug logging (toggle with F12)
         self.audio_logger = AudioLogger.get_instance()
         self.audio_logger.enable(False)  # Disabled by default
+
+        # Spatial audio logging (toggle with L key)
+        # Shows detailed info about: positioning, occlusion, reverb, ducking, etc.
+        self._spatial_audio_logging = False
+
+        # Thruster toggle flag (spacebar press detection)
+        self._space_pressed = False
 
         # Start power-up sequence
         self._start_powerup_sequence()
@@ -199,6 +207,20 @@ class Game:
                 elif event.key == pygame.K_F12:
                     self.audio_logger.toggle()
 
+                # L: Toggle spatial audio logging (detailed positioning/occlusion/reverb)
+                elif event.key == pygame.K_l:
+                    self._spatial_audio_logging = not self._spatial_audio_logging
+                    set_audio_logging(self._spatial_audio_logging)
+                    if self._spatial_audio_logging:
+                        self.tts.speak("Spatial audio logging enabled", duck_audio=False)
+                    else:
+                        self.tts.speak("Spatial audio logging disabled", duck_audio=False)
+
+                # Shift+L: Cycle log detail level (0=minimal, 1=normal, 2=verbose)
+                elif event.key == pygame.K_l and pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    # This won't trigger due to order, but kept for documentation
+                    pass
+
                 # Volume control
                 elif event.key == pygame.K_EQUALS:
                     self.audio.adjust_volume(VOLUME_STEP)
@@ -233,6 +255,10 @@ class Game:
                     self._announce_hull_status()
                 elif event.key == pygame.K_i:
                     self._announce_contact_count()
+
+                # Spacebar: Toggle thrusters on/off
+                elif event.key == pygame.K_SPACE:
+                    self._space_pressed = True
 
                 # Radar, camo, and echolocation
                 elif event.key == pygame.K_r:
@@ -368,7 +394,7 @@ class Game:
 
         print(f"\n=== MECH ONLINE (Max drones: {drone_count}) ===")
         print("WASD to move (tank controls). Q/E to rotate. Keys 1-4 to switch weapons. CTRL to fire.")
-        print("Z=Shield (hold). Page Up/Down for thrusters. C=Camo. R=Radar. X=Echo. F=Fabricate.")
+        print("Z=Shield (hold). SPACE=Thrusters toggle. PgUp/PgDn=Thrust. C=Camo. R=Radar. X=Echo. F=Fabricate.")
         print("T=Ammo. Y=Thrust. U=Hull. I=Contacts. +/- volume. F12=Debug. ESC quit.\n")
 
     def _update_rotation(self, keys, dt: float, current_time: int):
@@ -381,7 +407,12 @@ class Game:
 
     def _update_thrusters(self, keys, dt: float, current_time: int):
         """Update thruster system."""
-        result = self.thrusters.update(keys, dt, current_time, reveal_callback=self.camo.reveal)
+        result = self.thrusters.update(
+            keys, dt, current_time,
+            space_pressed=self._space_pressed,
+            reveal_callback=self.camo.reveal
+        )
+        self._space_pressed = False  # Reset after handling
 
         # Handle landing
         if result['landed']:

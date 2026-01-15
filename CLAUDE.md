@@ -225,8 +225,9 @@ def check_transitions(self):
 - **Z** (hold): Activate shield (release to deactivate)
 
 ### Thrusters
-- **Page Up** (hold): Increase thrust
-- **Page Down** (hold): Decrease thrust
+- **Spacebar**: Toggle thrusters on/off
+- **Page Up** (hold): Increase thrust level
+- **Page Down** (hold): Decrease thrust level
 
 ### Other
 - **F**: Fabricate ammo (costs 5 debris, takes 3 seconds)
