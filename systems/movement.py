@@ -10,7 +10,8 @@ import random
 from state.constants import (
     STEP_INTERVAL, PLAYER_SPEED, ROTATION_SPEED,
     LEFT_FOOT_INDICES, RIGHT_FOOT_INDICES,
-    DEBRIS_COLLECTION_CHANCE, DEBRIS_ANNOUNCEMENT_COOLDOWN
+    DEBRIS_COLLECTION_CHANCE, DEBRIS_ANNOUNCEMENT_COOLDOWN,
+    CAMO_FOOTSTEP_VOLUME_MULT, CAMO_REVEAL_FOOTSTEP
 )
 from utils.helpers import get_cardinal_direction, normalize_angle
 
@@ -22,7 +23,7 @@ class MovementSystem:
     FOOT_SIDE_OFFSET = 0.4   # Distance from center to each foot (left/right)
     FOOT_FORWARD_OFFSET = 0.3  # Forward offset during step
 
-    def __init__(self, audio_manager, sound_loader, tts, game_state):
+    def __init__(self, audio_manager, sound_loader, tts, game_state, camo_system=None):
         """Initialize the movement system.
 
         Args:
@@ -30,11 +31,13 @@ class MovementSystem:
             sound_loader: SoundLoader instance
             tts: TTSManager instance
             game_state: GameState instance
+            camo_system: CamouflageSystem instance (optional)
         """
         self.audio = audio_manager
         self.sounds = sound_loader
         self.tts = tts
         self.state = game_state
+        self.camo = camo_system
 
     def update_rotation(self, keys, dt: float, current_time: int):
         """Update rotation based on Q/E keys.
@@ -223,14 +226,23 @@ class MovementSystem:
         if sound:
             # Play footstep at actual foot position in 3D space
             foot_pos = self._get_foot_position(is_left_foot)
-            self.audio.play_sound_object(sound, 'movement', position_3d=foot_pos)
+            channel = self.audio.play_sound_object(sound, 'movement', position_3d=foot_pos)
+
+            # Attenuate footsteps when camo is active
+            if channel and self.state.camo_active:
+                try:
+                    current_vol = channel.volume
+                    channel.volume = current_vol * CAMO_FOOTSTEP_VOLUME_MULT
+                except:
+                    pass  # Channel may have ended or been invalidated
+
             print(f"STEP: {'left' if is_left_foot else 'right'}")
 
         self.state.last_step_time = current_time
 
-        # Reveal camo'd player
-        if reveal_callback:
-            reveal_callback(current_time)
+        # Reveal camo'd player with shorter duration for footsteps
+        if self.camo:
+            self.camo.reveal(current_time, CAMO_REVEAL_FOOTSTEP)
 
         # Debris collection
         if random.random() < DEBRIS_COLLECTION_CHANCE:

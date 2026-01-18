@@ -55,6 +55,7 @@ class GameState:
         self.camo_revealed = False
         self.camo_revealed_end = 0
         self.camo_energy = CAMO_ENERGY_MAX
+        self.camo_ambush_ready = False  # True when first attack from camo gets bonus
 
         # Shield state
         self.shield_active = False

@@ -18,6 +18,9 @@ class RadarSystem:
     ECHO_PITCH_MIN = 0.6  # Pitch multiplier at max distance
     ECHO_PITCH_MAX = 1.4  # Pitch multiplier at min distance
 
+    # Contact ping constants
+    PING_STAGGER_MS = 150  # Time between staggered contact pings
+
     def __init__(self, audio_manager, sound_loader, tts, game_state, drone_manager):
         """Initialize the radar system.
 
@@ -37,6 +40,9 @@ class RadarSystem:
         # Echolocation state
         self._last_echo_time = 0
         self._echo_enabled = False
+
+        # Staggered ping queue: list of (play_time, drone_data) tuples
+        self._ping_queue = []
 
     def scan(self, current_time: int):
         """Perform a radar scan and announce contacts.
@@ -100,39 +106,72 @@ class RadarSystem:
         print(f"Radar scan: {len(active_drones)} contacts")
 
     def _play_contact_pings(self, drones: list, current_time: int):
-        """Play spatialized pings for each contact with pitch-based distance.
+        """Queue spatialized pings for each contact with pitch-based distance.
 
         ACCESSIBILITY: Higher pitch = closer target.
         Spatial audio indicates direction.
+        Pings are staggered over time to prevent channel conflicts.
         """
-        import pygame
-
         beacon_sound = self.sounds.get_drone_sound('beacons', 0)
         if not beacon_sound:
             return
 
-        # Play a quick succession of pings for each drone
+        # Clear any existing queue and queue new pings with staggered timing
+        self._ping_queue.clear()
+
         for i, drone in enumerate(drones):
             # Calculate pitch based on distance (closer = higher pitch)
-            distance = drone.get('distance', self.ECHO_MAX_DISTANCE)
+            distance = drone['distance']
             normalized_dist = min(1.0, distance / self.ECHO_MAX_DISTANCE)
             # Inverse: closer = higher pitch
             pitch = self.ECHO_PITCH_MAX - (normalized_dist * (self.ECHO_PITCH_MAX - self.ECHO_PITCH_MIN))
 
-            # Get spatial positioning
-            pan = drone.get('pan', 0)
-            vol = drone.get('vol', 0.5)
+            # Get spatial positioning (use cached values)
+            pan = drone['pan']
+            vol = drone['vol']
 
-            # Play ping with delay based on order
-            # Note: pygame.time.delay would block, so we just play with volume/pan adjustment
-            # For a proper staggered effect, this would need a timer system
-            channel = self.audio.get_channel('player_damage')
-            if channel:
-                # Apply spatial audio
-                base_vol = BASE_VOLUMES.get('drone', 0.8)
-                final_vol = base_vol * vol * self.audio.master_volume * 0.6
-                channel.set_volume(final_vol)
-                channel.play(beacon_sound)
+            # Calculate play time with staggered delay
+            play_time = current_time + (i * self.PING_STAGGER_MS)
+
+            # Queue the ping data
+            self._ping_queue.append({
+                'play_time': play_time,
+                'sound': beacon_sound,
+                'vol': vol,
+                'pan': pan,
+                'pitch': pitch
+            })
+
+    def update(self, current_time: int):
+        """Update radar system - process staggered ping queue.
+
+        Call this every frame to play queued contact pings.
+
+        Args:
+            current_time: Current game time in milliseconds
+        """
+        # Update echolocation
+        self.update_echolocation(current_time)
+
+        # Process ping queue
+        if not self._ping_queue:
+            return
+
+        # Play any pings whose time has come
+        pings_to_remove = []
+        for ping in self._ping_queue:
+            if current_time >= ping['play_time']:
+                channel = self.audio.get_channel('player_damage')
+                if channel:
+                    base_vol = BASE_VOLUMES.get('drone', 0.8)
+                    final_vol = base_vol * ping['vol'] * self.audio.master_volume * 0.6
+                    channel.set_volume(final_vol)
+                    channel.play(ping['sound'])
+                pings_to_remove.append(ping)
+
+        # Remove played pings
+        for ping in pings_to_remove:
+            self._ping_queue.remove(ping)
 
     def update_echolocation(self, current_time: int):
         """Update continuous echolocation system.

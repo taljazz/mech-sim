@@ -50,10 +50,10 @@ class SpatialAudio:
             - relative_angle: Angle relative to facing (-180 to 180)
             - altitude_diff: Altitude difference (source - listener)
         """
-        # Calculate 2D distance
+        # Calculate 2D distance (hypot is faster than sqrt(dx*dx + dy*dy))
         dx = source_x - listener_x
         dy = source_y - listener_y
-        distance = math.sqrt(dx * dx + dy * dy)
+        distance = math.hypot(dx, dy)
 
         # Calculate altitude difference
         altitude_diff = source_altitude - listener_altitude

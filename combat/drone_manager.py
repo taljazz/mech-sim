@@ -14,7 +14,7 @@ from state.constants import (
     TARGET_LOCK_ANGLE, TARGET_LOCK_COOLDOWN,
     DRONE_ATTACK_WINDUP_MS, DRONE_ATTACK_WINDUP_ENABLED,
     # AI Personalities
-    DRONE_PERSONALITIES, DRONE_PERSONALITY_WEIGHTS,
+    DRONE_PERSONALITIES, DRONE_PERSONALITY_WEIGHTS, PERSONALITY_WEAPON_PREFS,
     # Evasion
     EVASION_INTERVAL_MIN, EVASION_INTERVAL_MAX, EVASION_ANGLE_VARIANCE,
     # State transitions
@@ -26,17 +26,39 @@ from state.constants import (
     # Search patterns
     SEARCH_SPIRAL_EXPANSION, SEARCH_ZIGZAG_WIDTH, SEARCH_WANDER_DISTANCE,
     DRONE_SEARCH_TIMEOUT_MIN, DRONE_SEARCH_TIMEOUT_MAX,
+    SEARCH_EXPAND_ENABLED, SEARCH_EXPAND_INTERVAL, SEARCH_EXPAND_MULTIPLIER, SEARCH_EXPAND_MAX_MULT,
     # Flanking
     FLANK_SEPARATION_MIN, FLANK_SEPARATION_MAX, FLANK_CIRCLE_SPEED,
     FLANK_DISTANCE_MIN, FLANK_DISTANCE_MAX,
+    ALTITUDE_FLANK_ENABLED, ALTITUDE_FLANK_OFFSET_MIN, ALTITUDE_FLANK_OFFSET_MAX,
     # Coordination
     CROSSFIRE_WINDOW,
+    COORDINATED_ASSAULT_ENABLED, COORDINATED_ASSAULT_RANGE, COORDINATED_ASSAULT_SYNC_WINDOW,
+    COORDINATED_ASSAULT_CONVERGE_ANGLE,
     # Movement constants (moved from function-level imports)
     DRONE_ENGAGE_SPEED_MULT, DRONE_EVASION_SPEED, DRONE_EVASION_ANGLE,
     # Attack adaptation
     ATTACK_FRUSTRATION_THRESHOLD, ATTACK_BREAK_OFF_CHANCE, ATTACK_MIN_SHOTS_BEFORE_ADAPT,
+    ATTACK_ADAPTATION_ENABLED, ATTACK_WEAPON_SWITCH_THRESHOLD, ATTACK_RANGE_ADJUST_THRESHOLD,
     # Sound reactions
-    SOUND_REACTION_RANGE, SOUND_REACTION_DODGE_CHANCE, SOUND_REACTION_COOLDOWN
+    SOUND_REACTION_RANGE, SOUND_REACTION_DODGE_CHANCE, SOUND_REACTION_COOLDOWN,
+    SOUND_DETECTION_ENABLED, SOUND_DETECTION_RANGE, SOUND_DETECTION_CHANCE,
+    # Wounded state
+    WOUNDED_HEALTH_THRESHOLD, WOUNDED_EVASION_MULT, WOUNDED_AGGRESSION_MULT,
+    WOUNDED_SPEED_MULT, WOUNDED_ERRATIC_INTERVAL,
+    # Suppression state
+    SUPPRESSION_ENABLED, SUPPRESSION_DAMAGE_THRESHOLD, SUPPRESSION_TIME_WINDOW,
+    SUPPRESSION_DURATION_MIN, SUPPRESSION_DURATION_MAX, SUPPRESSION_COOLDOWN,
+    # Distress beacon
+    DISTRESS_BEACON_ENABLED, DISTRESS_DAMAGE_THRESHOLD, DISTRESS_HEALTH_THRESHOLD,
+    DISTRESS_BEACON_DURATION, DISTRESS_ALERT_RANGE, DISTRESS_RESPONSE_SPEED_MULT,
+    # Evasion feinting
+    FEINT_ENABLED, FEINT_CHANCE, FEINT_DOUBLE_BACK_DELAY,
+    # Camo system
+    CAMO_SOUND_DETECTION_RANGE_MULT, CAMO_PROXIMITY_WARNING_ENABLED,
+    CAMO_PROXIMITY_WARNING_RANGE, CAMO_PROXIMITY_WARNING_INTERVAL,
+    CAMO_AMBUSH_ENABLED, CAMO_AMBUSH_DAMAGE_MULT,
+    CAMO_CONFUSION_ENABLED, CAMO_CONFUSION_DURATION, CAMO_CONFUSION_LOSE_LOCK_RANGE
 )
 from audio.spatial import SpatialAudio
 
@@ -67,11 +89,15 @@ class DroneManager:
     # Panning update threshold (radians) - only update if angle changed significantly
     PAN_UPDATE_THRESHOLD = 0.05  # ~3 degrees
 
-    # Audio fade durations (milliseconds)
-    TAKEOFF_FADE_IN_MS = 200      # Fade in for drone spawn/takeoff sounds
-    PASSBY_FADE_IN_MS = 300       # Fade in for patrol passby sounds
-    SUPERSONIC_FADE_IN_MS = 150   # Fade in for engaging supersonic sounds
-    AMBIENT_CROSSFADE_MS = 250    # Crossfade between ambient sounds
+    # Pan smoothing factor (0-1): higher = smoother but slower response
+    # 0.75 means 75% old value + 25% new value per frame (smooth transitions)
+    PAN_SMOOTHING_FACTOR = 0.75
+
+    # Audio fade durations (milliseconds) - increased for smoother transitions
+    TAKEOFF_FADE_IN_MS = 300      # Fade in for drone spawn/takeoff sounds
+    PASSBY_FADE_IN_MS = 500       # Fade in for patrol passby sounds (longer for smooth entry)
+    SUPERSONIC_FADE_IN_MS = 350   # Fade in for engaging supersonic sounds (smoother transition)
+    AMBIENT_CROSSFADE_MS = 400    # Crossfade between ambient sounds (reduced audio dropouts)
 
     # Cached personality selection data (avoid recreating lists each spawn)
     _PERSONALITY_TYPES = list(DRONE_PERSONALITY_WEIGHTS.keys())
@@ -101,6 +127,12 @@ class DroneManager:
         # Cached active drones list (updated once per frame)
         self._cached_active_drones = []
         self._active_drones_dirty = True
+
+        # OPTIMIZATION: Cached player position (updated once per frame)
+        self._player_x = 0.0
+        self._player_y = 0.0
+        self._player_altitude = 0.0
+        self._player_facing = 0.0
 
     def set_drone_pool(self, pool):
         """Set the drone audio pool (called after config menu).
@@ -162,6 +194,12 @@ class DroneManager:
             return []
 
         events = []
+
+        # OPTIMIZATION: Cache player position once at frame start
+        self._player_x = self.state.player_x
+        self._player_y = self.state.player_y
+        self._player_altitude = self.state.player_altitude
+        self._player_facing = self.state.facing_angle
 
         # Mark active drones cache as dirty at start of frame
         self._active_drones_dirty = True
@@ -236,8 +274,8 @@ class DroneManager:
         spawn_distance = random.uniform(DRONE_SPAWN_DISTANCE_MIN, DRONE_SPAWN_DISTANCE_MAX)
 
         angle_rad = math.radians(spawn_angle)
-        spawn_x = self.state.player_x + spawn_distance * math.sin(angle_rad)
-        spawn_y = self.state.player_y + spawn_distance * math.cos(angle_rad)
+        spawn_x = self._player_x + spawn_distance * math.sin(angle_rad)
+        spawn_y = self._player_y + spawn_distance * math.cos(angle_rad)
 
         # Select personality using weighted random choice (cached lists)
         personality_type = random.choices(
@@ -300,7 +338,45 @@ class DroneManager:
             # Search pattern
             'search_pattern': None,
             'search_waypoints': [],
-            'search_waypoint_index': 0
+            'search_waypoint_index': 0,
+            # OPTIMIZATION: Pre-computed channel IDs to avoid per-frame string allocation
+            '_channel_ids': {
+                'ambient': f"drone_{len(self.drones)}_ambient",
+                'combat': f"drone_{len(self.drones)}_combat",
+                'takeoff': f"drone_{len(self.drones)}_takeoff",
+                'passby': f"drone_{len(self.drones)}_passby",
+                'supersonic': f"drone_{len(self.drones)}_supersonic",
+                'explosion': f"drone_{len(self.drones)}_explosion",
+                'debris': f"drone_{len(self.drones)}_debris"
+            },
+            # === NEW BEHAVIOR FIELDS ===
+            # Wounded state
+            'is_wounded': False,
+            'wounded_erratic_timer': 0.0,
+            # Suppression state
+            'is_suppressed': False,
+            'suppression_end_time': 0,
+            'suppression_cooldown_end': 0,
+            'recent_damage': 0,
+            'damage_window_start': 0,
+            # Distress beacon
+            'distress_active': False,
+            'distress_start_time': 0,
+            # Coordinated assault
+            'in_coordinated_assault': False,
+            'assault_partner_id': None,
+            'assault_converge_angle': 0,
+            # Altitude flanking
+            'target_flank_altitude': None,
+            # Evasion feinting
+            'feint_pending': False,
+            'feint_timer': 0.0,
+            # Attack adaptation
+            'weapon_history': [],  # Track weapon effectiveness
+            'preferred_range': None,  # Learned optimal range
+            # Search expansion
+            'search_expand_count': 0,
+            'last_search_expand': 0
         }
 
         self.drones.append(drone)
@@ -352,15 +428,24 @@ class DroneManager:
         pan, vol, distance, rel_angle, alt_diff = self.audio.calculate_spatial_audio(
             source_x=drone['x'],
             source_y=drone['y'],
-            source_altitude=drone.get('altitude', 50),
-            listener_x=self.state.player_x,
-            listener_y=self.state.player_y,
-            listener_altitude=self.state.player_altitude,
-            listener_facing=self.state.facing_angle
+            source_altitude=drone['altitude'],
+            listener_x=self._player_x,
+            listener_y=self._player_y,
+            listener_altitude=self._player_altitude,
+            listener_facing=self._player_facing
         )
 
-        # Cache ALL spatial values including pan/vol for reuse this frame
-        drone['pan'] = pan
+        # Apply pan smoothing to prevent jittery spatial audio during fast movement
+        # Use exponential moving average: smoothed = old * factor + new * (1 - factor)
+        if 'pan' in drone:
+            old_pan = drone['pan']
+            smoothed_pan = old_pan * self.PAN_SMOOTHING_FACTOR + pan * (1 - self.PAN_SMOOTHING_FACTOR)
+        else:
+            smoothed_pan = pan  # First frame, no smoothing needed
+
+        # Cache ALL spatial values including smoothed pan/vol for reuse this frame
+        drone['pan'] = smoothed_pan
+        drone['raw_pan'] = pan  # Store raw value for debugging
         drone['vol'] = vol
         drone['distance'] = distance
         drone['relative_angle'] = rel_angle
@@ -369,21 +454,21 @@ class DroneManager:
 
         # Calculate velocity for Doppler effect (meters per second)
         if dt > 0.001:  # Avoid division by zero
-            prev_x = drone.get('prev_x', drone['x'])
-            prev_y = drone.get('prev_y', drone['y'])
-            prev_alt = drone.get('prev_altitude', drone.get('altitude', 50))
+            prev_x = drone['prev_x']
+            prev_y = drone['prev_y']
+            prev_alt = drone['prev_altitude']
 
             # Calculate velocity components
             vx = (drone['x'] - prev_x) / dt
             vy = (drone['y'] - prev_y) / dt
-            vz = (drone.get('altitude', 50) - prev_alt) / dt / 3.28  # Convert ft to m
+            vz = (drone['altitude'] - prev_alt) / dt / 3.28  # Convert ft to m
 
             drone['velocity'] = (vx, vy, vz)
 
             # Store current position for next frame
             drone['prev_x'] = drone['x']
             drone['prev_y'] = drone['y']
-            drone['prev_altitude'] = drone.get('altitude', 50)
+            drone['prev_altitude'] = drone['altitude']
 
         # === LOGGING ===
         alog = _get_audio_log()
@@ -464,7 +549,7 @@ class DroneManager:
                 base_pitch = AUDIO_PITCH_FAR + factor * (AUDIO_PITCH_FAR * 0.98 - AUDIO_PITCH_FAR)
 
         # Add speed-based pitch boost
-        velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+        velocity = drone['velocity']
         speed = (velocity[0]**2 + velocity[1]**2 + velocity[2]**2) ** 0.5
 
         pitch_boost = 0.0
@@ -493,8 +578,7 @@ class DroneManager:
         Returns:
             Tuple of (x, y, altitude_meters) in game coordinates
         """
-        drone_altitude = drone.get('altitude', 50)
-        altitude_meters = drone_altitude / 3.28
+        altitude_meters = drone['altitude'] / 3.28
         return (drone['x'], drone['y'], altitude_meters)
 
     def _set_3d_position(self, channel, drone: dict, channel_type: str = 'ambient', dt: float = 0.016):
@@ -505,33 +589,33 @@ class DroneManager:
         Includes smooth occlusion transitions to prevent jarring audio changes.
         Also updates distance-based reverb for spatial depth perception.
 
+        OPTIMIZATION: Uses cached spatial values from _update_spatial_audio() instead
+        of recalculating. Values are already computed and stored in drone dict.
+
         Args:
             channel: FMODChannelWrapper to position
-            drone: Drone dictionary with position data
+            drone: Drone dictionary with position data (including cached spatial values)
             channel_type: Type of channel ('ambient', 'combat') for unique ID
             dt: Delta time in seconds for smooth interpolation
         """
         if channel and hasattr(channel, 'set_3d_position'):
             # Convert altitude from feet to meters for audio positioning
-            drone_altitude = drone.get('altitude', 50)
-            altitude_meters = drone_altitude / 3.28
+            altitude_meters = drone['altitude'] / 3.28
 
-            # Get velocity for Doppler effect (default to zero if not calculated yet)
-            velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+            # Get velocity for Doppler effect
+            velocity = drone['velocity']
 
             # Set 3D position with velocity for Doppler
             channel.set_3d_position(drone['x'], drone['y'], altitude_meters, velocity=velocity)
 
-            # Calculate and apply enhanced directional filter
-            # (includes air absorption and occlusion simulation)
-            relative_angle, altitude_diff, distance = self.audio.calculate_directional_params(
-                drone['x'], drone['y'], drone_altitude,
-                self.state.player_x, self.state.player_y, self.state.player_altitude,
-                self.state.facing_angle
-            )
+            # OPTIMIZATION: Use cached spatial values from _update_spatial_audio()
+            # instead of recalculating with calculate_directional_params()
+            relative_angle = drone['relative_angle']
+            altitude_diff = drone['altitude_diff']
+            distance = drone['distance']
 
-            # Create unique channel ID for smooth occlusion transitions
-            channel_id = f"drone_{drone['id']}_{channel_type}"
+            # OPTIMIZATION: Use pre-computed channel ID to avoid per-frame string allocation
+            channel_id = drone['_channel_ids'].get(channel_type, f"drone_{drone['id']}_{channel_type}")
 
             # Apply directional filter with dt for smooth interpolation
             self.audio.apply_directional_filter(
@@ -568,6 +652,32 @@ class DroneManager:
         lose_track_range = DRONE_CAMO_LOSE_TRACK_RANGE if camo_effective else DRONE_LOSE_TRACK_RANGE
         reacquire_range = DRONE_CAMO_REACQUIRE_RANGE if camo_effective else DRONE_REACQUIRE_RANGE
 
+        # === WOUNDED STATE CHECK ===
+        # Update wounded status based on health
+        health_percent = (drone['health'] / 100.0) * 100
+        if health_percent <= WOUNDED_HEALTH_THRESHOLD and not drone['is_wounded']:
+            drone['is_wounded'] = True
+            # Modify behavior when wounded
+            drone['evasion_skill'] *= WOUNDED_EVASION_MULT
+            drone['aggression'] *= WOUNDED_AGGRESSION_MULT
+            self.tts.speak("Drone wounded")
+
+        # === SUPPRESSION STATE CHECK ===
+        if SUPPRESSION_ENABLED and drone['is_suppressed']:
+            if current_time >= drone['suppression_end_time']:
+                drone['is_suppressed'] = False
+                drone['suppression_cooldown_end'] = current_time + SUPPRESSION_COOLDOWN
+            else:
+                # Can't attack while suppressed - just evade
+                if drone['state'] in ('engaging', 'winding_up', 'attacking'):
+                    self._move_engaging(drone, dt)
+                    return  # Skip normal state processing
+
+        # === DISTRESS BEACON UPDATE ===
+        if drone['distress_active']:
+            if current_time - drone['distress_start_time'] >= DISTRESS_BEACON_DURATION:
+                drone['distress_active'] = False
+
         state = drone['state']
 
         if state == 'spawning':
@@ -588,19 +698,18 @@ class DroneManager:
             if drone['distance'] <= detect_range:
                 drone['state'] = 'detecting'
                 drone['state_start'] = current_time
-                drone['last_known_x'] = self.state.player_x
-                drone['last_known_y'] = self.state.player_y
+                drone['last_known_x'] = self._player_x
+                drone['last_known_y'] = self._player_y
                 self._play_detection_sound(drone)
 
         elif state == 'detecting':
-            drone['last_known_x'] = self.state.player_x
-            drone['last_known_y'] = self.state.player_y
+            drone['last_known_x'] = self._player_x
+            drone['last_known_y'] = self._player_y
             # Get or calculate detect duration (randomized)
             if 'state_duration' not in drone:
                 drone['state_duration'] = random.randint(DRONE_DETECT_DURATION_MIN, DRONE_DETECT_DURATION_MAX)
                 # Check for hesitation (personality-based delay)
-                hesitation_chance = drone.get('hesitation_chance', HESITATION_CHANCE)
-                if random.random() < hesitation_chance:
+                if random.random() < drone['hesitation_chance']:
                     drone['hesitating'] = True
                     drone['state_duration'] += random.randint(300, 600)  # Additional hesitation delay
             if current_time - drone['state_start'] >= drone['state_duration']:
@@ -628,10 +737,10 @@ class DroneManager:
             self._move_engaging(drone, dt)
 
             # Adjust altitude
-            self._adjust_altitude(drone, self.state.player_altitude, dt)
+            self._adjust_altitude(drone, self._player_altitude, dt)
 
-            drone['last_known_x'] = self.state.player_x
-            drone['last_known_y'] = self.state.player_y
+            drone['last_known_x'] = self._player_x
+            drone['last_known_y'] = self._player_y
 
             if drone['distance'] > lose_track_range:
                 drone['state'] = 'searching'
@@ -667,8 +776,8 @@ class DroneManager:
                 alog.drone_state(drone['id'], 'attacking', drone['distance'], old_state='winding_up')
                 self._execute_attack(drone, damage_system, current_time)
             # Drone still tracks player during wind-up
-            drone['last_known_x'] = self.state.player_x
-            drone['last_known_y'] = self.state.player_y
+            drone['last_known_x'] = self._player_x
+            drone['last_known_y'] = self._player_y
 
         elif state == 'searching':
             # Initialize search pattern if not set
@@ -677,10 +786,28 @@ class DroneManager:
                 drone['search_pattern'] = random.choice(patterns)
                 drone['search_waypoints'] = self._generate_search_waypoints(
                     drone,
-                    drone.get('last_known_x', self.state.player_x),
-                    drone.get('last_known_y', self.state.player_y)
+                    drone.get('last_known_x', self._player_x),
+                    drone.get('last_known_y', self._player_y)
                 )
                 drone['search_waypoint_index'] = 0
+                drone['search_expand_count'] = 0
+                drone['last_search_expand'] = current_time
+
+            # === EXPANDING SEARCH RADIUS ===
+            if SEARCH_EXPAND_ENABLED:
+                if current_time - drone['last_search_expand'] >= SEARCH_EXPAND_INTERVAL:
+                    drone['last_search_expand'] = current_time
+                    current_mult = 1.0 + (drone['search_expand_count'] * (SEARCH_EXPAND_MULTIPLIER - 1.0))
+                    if current_mult < SEARCH_EXPAND_MAX_MULT:
+                        drone['search_expand_count'] += 1
+                        # Regenerate waypoints with expanded radius
+                        drone['search_waypoints'] = self._generate_search_waypoints(
+                            drone,
+                            drone.get('last_known_x', self._player_x),
+                            drone.get('last_known_y', self._player_y),
+                            expand_mult=1.0 + (drone['search_expand_count'] * (SEARCH_EXPAND_MULTIPLIER - 1.0))
+                        )
+                        drone['search_waypoint_index'] = 0
 
             # Get current waypoint
             waypoints = drone.get('search_waypoints', [])
@@ -693,8 +820,8 @@ class DroneManager:
                     drone['search_waypoint_index'] = wp_index + 1
             else:
                 # Fallback to last known position if no waypoints left
-                target = (drone.get('last_known_x', self.state.player_x),
-                          drone.get('last_known_y', self.state.player_y))
+                target = (drone.get('last_known_x', self._player_x),
+                          drone.get('last_known_y', self._player_y))
                 reached = self._move_drone_toward(drone, target, dt)
 
             # Get or calculate search timeout (randomized)
@@ -704,8 +831,8 @@ class DroneManager:
             if drone['distance'] <= reacquire_range:
                 drone['state'] = 'detecting'
                 drone['state_start'] = current_time
-                drone['last_known_x'] = self.state.player_x
-                drone['last_known_y'] = self.state.player_y
+                drone['last_known_x'] = self._player_x
+                drone['last_known_y'] = self._player_y
                 drone.pop('state_duration', None)
                 # Clear search pattern data
                 drone['search_pattern'] = None
@@ -731,8 +858,8 @@ class DroneManager:
                 # Set randomized cooldown duration for this burst
                 drone['cooldown_duration'] = random.randint(DRONE_COOLDOWN_MIN, DRONE_COOLDOWN_MAX)
                 # Store player position for reassessment tracking
-                drone['last_attack_x'] = self.state.player_x
-                drone['last_attack_y'] = self.state.player_y
+                drone['last_attack_x'] = self._player_x
+                drone['last_attack_y'] = self._player_y
                 # Clear attack state
                 drone['shots_fired'] = 0
                 drone['last_shot_time'] = 0
@@ -746,14 +873,14 @@ class DroneManager:
                 drone['last_peek_time'] = current_time
 
                 # Check if should reassess (personality affects chance)
-                reassess_chance = COOLDOWN_REASSESS_CHANCE * (1 + drone.get('aggression', 0.5))
+                reassess_chance = COOLDOWN_REASSESS_CHANCE * (1 + drone['aggression'])
                 if random.random() < reassess_chance:
                     # Track player movement since attack started
                     last_attack_x = drone.get('last_attack_x', drone['last_known_x'])
                     last_attack_y = drone.get('last_attack_y', drone['last_known_y'])
-                    player_moved = math.sqrt(
-                        (self.state.player_x - last_attack_x) ** 2 +
-                        (self.state.player_y - last_attack_y) ** 2
+                    player_moved = math.hypot(
+                        self._player_x - last_attack_x,
+                        self._player_y - last_attack_y
                     )
 
                     # Panic response - player got very close
@@ -766,8 +893,8 @@ class DroneManager:
                     # Player moved significantly - re-engage immediately
                     elif player_moved > 10:
                         drone['state'] = 'engaging'
-                        drone['last_known_x'] = self.state.player_x
-                        drone['last_known_y'] = self.state.player_y
+                        drone['last_known_x'] = self._player_x
+                        drone['last_known_y'] = self._player_y
                         drone['state_start'] = current_time
                         return  # Exit early
 
@@ -778,8 +905,8 @@ class DroneManager:
             if current_time - drone['state_start'] >= cooldown_duration:
                 if drone['distance'] <= lose_track_range:
                     drone['state'] = 'engaging'
-                    drone['last_known_x'] = self.state.player_x
-                    drone['last_known_y'] = self.state.player_y
+                    drone['last_known_x'] = self._player_x
+                    drone['last_known_y'] = self._player_y
                 else:
                     drone['state'] = 'searching'
                 drone['state_start'] = current_time
@@ -793,8 +920,8 @@ class DroneManager:
         - Flanking behavior when multiple drones are active
         - Aggressive pursuit speed
         """
-        player_x = self.state.player_x
-        player_y = self.state.player_y
+        player_x = self._player_x
+        player_y = self._player_y
 
         # Check if player is aiming at this drone
         being_aimed_at = abs(drone['relative_angle']) < DRONE_EVASION_ANGLE
@@ -805,7 +932,7 @@ class DroneManager:
 
         dx = player_x - drone['x']
         dy = player_y - drone['y']
-        dist = math.sqrt(dx * dx + dy * dy)
+        dist = math.hypot(dx, dy)
 
         if dist < 0.5:
             return
@@ -828,15 +955,36 @@ class DroneManager:
             perp_y = base_perp_x * sin_off + base_perp_y * cos_off
 
             # Evasion movement - skill affects speed
-            evasion_speed = DRONE_EVASION_SPEED * drone.get('evasion_skill', 1.0)
+            evasion_speed = DRONE_EVASION_SPEED * drone['evasion_skill']
             evasion_dist = evasion_speed * dt * drone['evasion_direction']
             drone['x'] += perp_x * evasion_dist
             drone['y'] += perp_y * evasion_dist
 
             # Update evasion timer using per-drone interval (varies by personality)
-            drone['evasion_timer'] = drone.get('evasion_timer', 0) + dt
-            evasion_interval = drone.get('evasion_interval', 0.5)
-            if drone['evasion_timer'] > evasion_interval:
+            drone['evasion_timer'] += dt
+
+            # === EVASION FEINTING ===
+            # Check for feint (fake direction change before real one)
+            if FEINT_ENABLED and not drone['feint_pending']:
+                if drone['evasion_timer'] > drone['evasion_interval'] * 0.8:
+                    # Near direction change - chance to feint
+                    if random.random() < FEINT_CHANCE:
+                        drone['feint_pending'] = True
+                        drone['feint_timer'] = 0.0
+                        # Fake out - reverse direction early
+                        drone['evasion_direction'] *= -1
+
+            # Handle feint double-back
+            if drone['feint_pending']:
+                drone['feint_timer'] += dt
+                if drone['feint_timer'] >= FEINT_DOUBLE_BACK_DELAY:
+                    # Double-back - reverse again (back to original direction)
+                    drone['evasion_direction'] *= -1
+                    drone['feint_pending'] = False
+                    drone['evasion_timer'] = 0
+                    drone['evasion_angle_offset'] = random.uniform(-EVASION_ANGLE_VARIANCE, EVASION_ANGLE_VARIANCE)
+
+            elif drone['evasion_timer'] > drone['evasion_interval']:
                 drone['evasion_timer'] = 0
                 drone['evasion_direction'] *= -1
                 # New random angle offset each direction change
@@ -886,6 +1034,17 @@ class DroneManager:
                 drone['flank_distance'] = random.uniform(FLANK_DISTANCE_MIN, FLANK_DISTANCE_MAX)
             flank_distance = drone['flank_distance']
 
+            # === ALTITUDE-BASED FLANKING ===
+            # Set altitude offset for tactical advantage (one high, one low)
+            if ALTITUDE_FLANK_ENABLED:
+                if drone['target_flank_altitude'] is None:
+                    # Determine altitude offset based on drone ID (alternates high/low)
+                    offset = random.uniform(ALTITUDE_FLANK_OFFSET_MIN, ALTITUDE_FLANK_OFFSET_MAX)
+                    if drone['id'] % 2 == 0:
+                        drone['target_flank_altitude'] = self._player_altitude + offset
+                    else:
+                        drone['target_flank_altitude'] = self._player_altitude - offset
+
             # Calculate new position on the circle
             target_x = player_x + flank_distance * math.sin(new_angle)
             target_y = player_y + flank_distance * math.cos(new_angle)
@@ -907,7 +1066,7 @@ class DroneManager:
         tx, ty = target
         dx = tx - drone['x']
         dy = ty - drone['y']
-        dist = math.sqrt(dx * dx + dy * dy)
+        dist = math.hypot(dx, dy)
 
         if dist < 0.5:
             return True
@@ -921,13 +1080,29 @@ class DroneManager:
         return False
 
     def _adjust_altitude(self, drone: dict, target_alt: float, dt: float):
-        """Adjust drone altitude."""
-        alt_diff = drone.get('altitude_diff', 0)
-        climb_rate = drone.get('climb_rate', 15.0)
+        """Adjust drone altitude.
+
+        Uses target_flank_altitude for flanking drones if set.
+        """
+        from state.constants import ALTITUDE_MAX
+
+        # Use flanking altitude if set, otherwise use passed target
+        if ALTITUDE_FLANK_ENABLED and drone['target_flank_altitude'] is not None:
+            target_alt = drone['target_flank_altitude']
+
+        # Calculate difference to target
+        alt_diff = drone['altitude'] - target_alt
+        climb_rate = drone['climb_rate']
+
+        # Wounded drones have erratic altitude
+        if drone['is_wounded']:
+            # Add random altitude jitter
+            if random.random() < WOUNDED_ERRATIC_INTERVAL:
+                alt_diff += random.uniform(-10, 10)
+
         if alt_diff > 5:
             drone['altitude'] = max(0, drone['altitude'] - climb_rate * dt)
         elif alt_diff < -5:
-            from state.constants import ALTITUDE_MAX
             drone['altitude'] = min(ALTITUDE_MAX, drone['altitude'] + climb_rate * dt)
 
     def _generate_patrol_point(self) -> tuple:
@@ -936,17 +1111,19 @@ class DroneManager:
         patrol_angle = random.uniform(0, 360)
         angle_rad = math.radians(patrol_angle)
         return (
-            self.state.player_x + patrol_distance * math.sin(angle_rad),
-            self.state.player_y + patrol_distance * math.cos(angle_rad)
+            self._player_x + patrol_distance * math.sin(angle_rad),
+            self._player_y + patrol_distance * math.cos(angle_rad)
         )
 
-    def _generate_search_waypoints(self, drone: dict, last_x: float, last_y: float) -> list:
+    def _generate_search_waypoints(self, drone: dict, last_x: float, last_y: float,
+                                     expand_mult: float = 1.0) -> list:
         """Generate waypoints for search pattern.
 
         Args:
             drone: Drone dictionary (contains search_pattern)
             last_x: Last known player X position
             last_y: Last known player Y position
+            expand_mult: Multiplier for search radius (for expanding search)
 
         Returns:
             List of (x, y) waypoints
@@ -954,11 +1131,16 @@ class DroneManager:
         pattern = drone.get('search_pattern', 'wander')
         waypoints = []
 
+        # Apply expansion multiplier to search distances
+        spiral_exp = SEARCH_SPIRAL_EXPANSION * expand_mult
+        zigzag_width = SEARCH_ZIGZAG_WIDTH * expand_mult
+        wander_dist = SEARCH_WANDER_DISTANCE * expand_mult
+
         if pattern == 'spiral':
             # Spiral outward from last known position
             for i in range(5):
                 angle = i * 72  # 72 degrees per step (5 steps = full circle)
-                radius = (i + 1) * SEARCH_SPIRAL_EXPANSION
+                radius = (i + 1) * spiral_exp
                 rad = math.radians(angle)
                 waypoints.append((
                     last_x + radius * math.sin(rad),
@@ -970,7 +1152,7 @@ class DroneManager:
             # Approach direction from drone to last known pos
             dx = last_x - drone['x']
             dy = last_y - drone['y']
-            dist = math.sqrt(dx * dx + dy * dy) or 1
+            dist = math.hypot(dx, dy) or 1
 
             # Perpendicular vector
             perp_x = -dy / dist
@@ -983,8 +1165,8 @@ class DroneManager:
             # Generate zigzag pattern
             for i in range(4):
                 side = 1 if i % 2 == 0 else -1
-                forward_dist = (i + 1) * 5  # 5m forward per step
-                lateral_dist = side * SEARCH_ZIGZAG_WIDTH
+                forward_dist = (i + 1) * 5 * expand_mult  # 5m forward per step, scaled
+                lateral_dist = side * zigzag_width
                 waypoints.append((
                     drone['x'] + fwd_x * forward_dist + perp_x * lateral_dist,
                     drone['y'] + fwd_y * forward_dist + perp_y * lateral_dist
@@ -994,7 +1176,7 @@ class DroneManager:
             # Random waypoints around last known position
             for _ in range(4):
                 angle = random.uniform(0, 360)
-                dist = random.uniform(SEARCH_WANDER_DISTANCE * 0.5, SEARCH_WANDER_DISTANCE)
+                dist = random.uniform(wander_dist * 0.5, wander_dist)
                 rad = math.radians(angle)
                 waypoints.append((
                     last_x + dist * math.sin(rad),
@@ -1005,24 +1187,46 @@ class DroneManager:
         waypoints.append((last_x, last_y))
         return waypoints
 
-    def react_to_player_fire(self, current_time: int):
+    def react_to_player_fire(self, current_time: int, weapon_type: str = None):
         """Make drones react when player fires a weapon.
 
         Called from WeaponSystem when player fires.
         Drones within range have a chance to dodge or advance.
+        Patrol drones can detect player via sound at extended range.
 
         Args:
             current_time: Current game time in ms
+            weapon_type: Type of weapon fired (for varied reactions)
         """
-        player_facing_rad = math.radians(self.state.facing_angle)
-        player_x = self.state.player_x
-        player_y = self.state.player_y
+        player_facing_rad = math.radians(self._player_facing)
+        player_x = self._player_x
+        player_y = self._player_y
 
         for drone in self.drones:
-            # Only react if within hearing range and alive
-            if drone['distance'] > SOUND_REACTION_RANGE:
+            if drone['state'] in ('spawning', 'destroyed'):
                 continue
-            if drone['state'] in ('spawning', 'dead'):
+
+            # === SOUND-BASED DETECTION FOR PATROL DRONES ===
+            if SOUND_DETECTION_ENABLED and drone['state'] in ('patrol', 'searching'):
+                # Camo reduces sound detection range by 50%
+                camo_effective = self.state.camo_active and not self.state.camo_revealed
+                sound_range = SOUND_DETECTION_RANGE
+                if camo_effective:
+                    sound_range = SOUND_DETECTION_RANGE * CAMO_SOUND_DETECTION_RANGE_MULT
+
+                if drone['distance'] <= sound_range:
+                    if random.random() < SOUND_DETECTION_CHANCE:
+                        # Sound gave away player position!
+                        drone['state'] = 'detecting'
+                        drone['state_start'] = current_time
+                        drone['last_known_x'] = player_x
+                        drone['last_known_y'] = player_y
+                        self._play_detection_sound(drone)
+                        self.tts.speak("Drone heard weapon")
+                        continue
+
+            # Only react if within hearing range
+            if drone['distance'] > SOUND_REACTION_RANGE:
                 continue
 
             # Check cooldown on reactions
@@ -1034,8 +1238,15 @@ class DroneManager:
             personality = drone.get('personality', 'veteran')
             aggression = drone.get('aggression', 0.5)
 
+            # === WEAPON-TYPE SPECIFIC REACTIONS ===
+            dodge_chance = SOUND_REACTION_DODGE_CHANCE * (1 - aggression)
+            if weapon_type == 'missiles':
+                dodge_chance = min(0.9, dodge_chance * 1.5)  # More likely to dodge missiles
+            elif weapon_type == 'emp':
+                dodge_chance = min(0.8, dodge_chance * 1.3)  # EMP is scary
+
             # Determine reaction type
-            if random.random() < SOUND_REACTION_DODGE_CHANCE * (1 - aggression):
+            if random.random() < dodge_chance:
                 # Dodge - move perpendicular to player's facing
                 perp_x = -math.cos(player_facing_rad)
                 perp_y = math.sin(player_facing_rad)
@@ -1043,6 +1254,10 @@ class DroneManager:
                 # Random direction left or right
                 dodge_dir = random.choice([-1, 1])
                 dodge_distance = 3.0  # Meters to dodge
+
+                # Missiles cause bigger dodge
+                if weapon_type == 'missiles':
+                    dodge_distance = 5.0
 
                 drone['x'] += perp_x * dodge_distance * dodge_dir
                 drone['y'] += perp_y * dodge_distance * dodge_dir
@@ -1053,7 +1268,7 @@ class DroneManager:
                     # Run away
                     dx = drone['x'] - player_x
                     dy = drone['y'] - player_y
-                    dist = math.sqrt(dx * dx + dy * dy) or 1
+                    dist = math.hypot(dx, dy) or 1
                     drone['x'] += (dx / dist) * 5  # Move 5m away
                     drone['y'] += (dy / dist) * 5
             else:
@@ -1062,7 +1277,7 @@ class DroneManager:
                     # Move toward player
                     dx = player_x - drone['x']
                     dy = player_y - drone['y']
-                    dist = math.sqrt(dx * dx + dy * dy) or 1
+                    dist = math.hypot(dx, dy) or 1
                     advance_distance = 2.0
 
                     drone['x'] += (dx / dist) * advance_distance
@@ -1120,8 +1335,8 @@ class DroneManager:
                     drone['hold_fire_until'] = current_time + 500  # Wait 500ms
         else:
             # Both engaging - assign complementary roles based on aggression
-            my_aggression = drone.get('aggression', 0.5)
-            other_aggression = other.get('aggression', 0.5)
+            my_aggression = drone['aggression']
+            other_aggression = other['aggression']
 
             if my_aggression > other_aggression:
                 drone['tactic_role'] = 'primary'
@@ -1129,6 +1344,36 @@ class DroneManager:
             else:
                 drone['tactic_role'] = 'flanker'
                 other['tactic_role'] = 'primary'
+
+            # === COORDINATED ASSAULT ===
+            # Check if both drones in range for synchronized attack
+            if COORDINATED_ASSAULT_ENABLED:
+                if (drone['distance'] <= COORDINATED_ASSAULT_RANGE and
+                    other['distance'] <= COORDINATED_ASSAULT_RANGE):
+                    # Both in range - initiate coordinated assault
+                    if not drone['in_coordinated_assault']:
+                        drone['in_coordinated_assault'] = True
+                        drone['assault_partner_id'] = other['id']
+                        # Set converge angles (attack from different directions)
+                        drone['assault_converge_angle'] = COORDINATED_ASSAULT_CONVERGE_ANGLE
+                        other['assault_converge_angle'] = -COORDINATED_ASSAULT_CONVERGE_ANGLE
+                        # Sync attack timing
+                        drone['hold_fire_until'] = current_time + COORDINATED_ASSAULT_SYNC_WINDOW
+                        other['hold_fire_until'] = current_time + COORDINATED_ASSAULT_SYNC_WINDOW
+
+                        # === COORDINATION AUDIO ===
+                        # Play transmission sound to indicate drones coordinating
+                        self._play_coordination_audio(drone)
+
+    def _play_coordination_audio(self, drone: dict):
+        """Play transmission sound when drones coordinate tactics."""
+        sound = self.sounds.get_drone_sound('transmissions')
+        if sound:
+            dc = self._get_drone_channels(drone['id'])
+            if dc:
+                pos = self._get_drone_3d_position(drone)
+                dc['combat'].play(sound, position_3d=pos)
+                self._set_3d_position(dc['combat'], drone, 'combat')
 
     def _play_detection_sound(self, drone: dict):
         """Play drone detection beacon sound with 3D positioning."""
@@ -1155,6 +1400,11 @@ class DroneManager:
 
         This gives players a ~200ms audio cue before the attack starts,
         allowing reaction time for shield activation or evasion.
+
+        WEAPON-SPECIFIC SOUNDS:
+        - Pulse cannon: Fast beeps (close range threat)
+        - Plasma launcher: Rising warble (medium range)
+        - Rail gun: Charging hum (long range, most dangerous)
         """
         # === LOGGING ===
         alog = _get_audio_log()
@@ -1165,15 +1415,29 @@ class DroneManager:
         )
         alog.drone_state(drone['id'], 'winding_up', drone['distance'], old_state='engaging')
 
-        # Use beacons sound as wind-up warning (higher pitch conveys urgency)
-        # Could also use a dedicated 'windup' sound if available
-        sound = self.sounds.get_drone_sound('beacons')
-        if sound:
-            dc = self._get_drone_channels(drone['id'])
-            if dc:
-                pos = self._get_drone_3d_position(drone)
-                velocity = drone.get('velocity', (0.0, 0.0, 0.0))
-                dc['combat'].play(sound, position_3d=pos, velocity=velocity)
+        # Pre-select weapon for this attack (stored for execution phase)
+        weapon_type = self._select_weapon(drone)
+        drone['attack_weapon'] = weapon_type
+
+        # === WEAPON-SPECIFIC WIND-UP SOUNDS ===
+        # Try to use weapon-specific sounds, fall back to beacons
+        dc = self._get_drone_channels(drone['id'])
+        if not dc:
+            return
+
+        pos = self._get_drone_3d_position(drone)
+
+        # Try weapon-specific sound first (weapon types are direct categories)
+        weapon_sound = self.sounds.get_drone_sound(weapon_type)
+        if weapon_sound:
+            dc['combat'].play(weapon_sound, position_3d=pos, velocity=drone['velocity'])
+            self._set_3d_position(dc['combat'], drone, 'combat')
+            alog.drone_audio(drone['id'], f'windup_{weapon_type}', 'play')
+        else:
+            # Fall back to beacon sounds with pitch variation by weapon
+            sound = self.sounds.get_drone_sound('beacons')
+            if sound:
+                dc['combat'].play(sound, position_3d=pos, velocity=drone['velocity'])
                 self._set_3d_position(dc['combat'], drone, 'combat')
                 alog.drone_audio(drone['id'], 'windup_beacon', 'play')
 
@@ -1200,7 +1464,7 @@ class DroneManager:
         pos = self._get_drone_3d_position(drone)
 
         # Get dt from drone (stored during spatial audio update)
-        dt = drone.get('dt', 0.016)
+        dt = drone['dt']
 
         # Update takeoff channel position if still playing
         if dc['takeoff'].get_busy():
@@ -1273,10 +1537,10 @@ class DroneManager:
         drone['next_shot_interval'] = random.randint(drone['interval_min'], drone['interval_max'])
 
         # Calculate hit chance once for this burst (personality affects accuracy)
-        accuracy_mult = drone.get('accuracy_mult', 1.0)
+        accuracy_mult = drone['accuracy_mult']
         distance_factor = drone['distance'] / weapon['range']
         hit_chance = (weapon['accuracy'] * accuracy_mult) - (distance_factor * 0.2)
-        altitude_diff = abs(drone.get('altitude_diff', 0))
+        altitude_diff = abs(drone['altitude_diff'])
         if altitude_diff > 20:
             altitude_penalty = min(0.3, altitude_diff / 150)
             hit_chance -= altitude_penalty
@@ -1306,7 +1570,7 @@ class DroneManager:
                 weapon_sound = self.sounds.get_drone_sound(weapon_type)
                 if weapon_sound and dc:
                     pos = self._get_drone_3d_position(drone)
-                    velocity = drone.get('velocity', (0.0, 0.0, 0.0))
+                    velocity = drone['velocity']
                     # Play with position and velocity for proper 3D + Doppler
                     dc['combat'].play(weapon_sound, position_3d=pos, velocity=velocity)
                     # Apply directional filters (lowpass for behind, etc.)
@@ -1316,7 +1580,7 @@ class DroneManager:
                 hit_chance = drone.get('hit_chance', 0.5)
                 if random.random() < hit_chance:
                     damage_system.apply_damage(weapon['damage'], current_time)
-                    drone['hits_this_burst'] = drone.get('hits_this_burst', 0) + 1
+                    drone['hits_this_burst'] += 1
 
                     # Play hit sound
                     hit_sound = self.sounds.get_drone_sound('projectile_hit')
@@ -1354,7 +1618,7 @@ class DroneManager:
                     self._log_attack_results(drone, weapon_type)
 
     def _log_attack_results(self, drone: dict, weapon_type: str):
-        """Log attack results after burst completes."""
+        """Log attack results after burst completes and apply attack adaptation."""
         if self.state.game_over:
             return
 
@@ -1362,35 +1626,111 @@ class DroneManager:
         shots_fired = drone.get('shots_fired', 0)
         hits = drone.get('hits_this_burst', 0)
         total_damage = hits * weapon['damage']
+        distance_at_attack = drone['distance']
 
         if hits > 0:
             print(f"Drone {drone['id']} ({weapon['name']}) {hits}/{shots_fired} hits for {total_damage} damage")
         else:
             print(f"Drone {drone['id']} ({weapon['name']}) missed")
 
+        # === CONTEXT-AWARE ATTACK ADAPTATION ===
+        if ATTACK_ADAPTATION_ENABLED:
+            hit_rate = hits / shots_fired if shots_fired > 0 else 0
+
+            # Track weapon effectiveness
+            if 'weapon_history' not in drone:
+                drone['weapon_history'] = []
+
+            drone['weapon_history'].append({
+                'weapon': weapon_type,
+                'hit_rate': hit_rate,
+                'distance': distance_at_attack,
+                'hits': hits,
+                'shots': shots_fired
+            })
+
+            # Keep only last 5 attacks for learning
+            if len(drone['weapon_history']) > 5:
+                drone['weapon_history'] = drone['weapon_history'][-5:]
+
+            # Learn optimal range from successful attacks
+            successful_attacks = [a for a in drone['weapon_history'] if a['hit_rate'] >= 0.3]
+            if successful_attacks:
+                avg_good_range = sum(a['distance'] for a in successful_attacks) / len(successful_attacks)
+                drone['preferred_range'] = avg_good_range
+
+            # If hit rate is very low, consider switching weapons next time
+            if hit_rate < ATTACK_WEAPON_SWITCH_THRESHOLD:
+                # Mark that this weapon didn't work well at this range
+                drone['_avoid_weapon'] = weapon_type
+                drone['_avoid_distance'] = distance_at_attack
+
+            # If hit rate is good, reinforce this weapon/range combo
+            if hit_rate >= 0.4:
+                drone['_effective_weapon'] = weapon_type
+                drone['_effective_distance'] = distance_at_attack
+
         # Reset burst tracking
         drone['hits_this_burst'] = 0
 
     def _select_weapon(self, drone: dict) -> str:
-        """Select weapon based on distance with some randomization.
+        """Select weapon based on distance AND personality.
 
-        Drones can use multiple weapon types at various ranges for variety.
+        Different personalities prefer different weapons and ranges.
+        Also considers attack adaptation (learned optimal range).
         """
         distance = drone['distance']
+        personality = drone['personality']
 
-        # Close range (0-15): Pulse cannon preferred, plasma possible
+        # Check if attack adaptation has set a preferred range
+        if ATTACK_ADAPTATION_ENABLED and drone.get('preferred_range'):
+            pref_range = drone['preferred_range']
+            # Adjust distance preference slightly toward learned optimal
+            distance = distance * 0.7 + pref_range * 0.3
+
+        # Get personality-specific weapon preferences
+        prefs = PERSONALITY_WEAPON_PREFS.get(personality, PERSONALITY_WEAPON_PREFS['veteran'])
+
+        # Find weapons valid for current distance
+        valid_weapons = []
+        for weapon, (min_range, max_range) in prefs.items():
+            if min_range <= distance <= max_range:
+                valid_weapons.append(weapon)
+
+        if valid_weapons:
+            # Wounded drones prefer faster weapons (panic)
+            if drone['is_wounded'] and 'pulse_cannon' in valid_weapons:
+                return 'pulse_cannon'
+
+            # Personality-based selection from valid weapons
+            if personality == 'berserker':
+                # Prefer high damage weapons
+                if 'rail_gun' in valid_weapons:
+                    return 'rail_gun' if random.random() < 0.6 else random.choice(valid_weapons)
+                if 'plasma_launcher' in valid_weapons:
+                    return 'plasma_launcher' if random.random() < 0.7 else random.choice(valid_weapons)
+            elif personality == 'ace':
+                # Optimal selection based on exact range
+                if distance <= 12 and 'pulse_cannon' in valid_weapons:
+                    return 'pulse_cannon'
+                elif distance <= 30 and 'plasma_launcher' in valid_weapons:
+                    return 'plasma_launcher'
+                elif 'rail_gun' in valid_weapons:
+                    return 'rail_gun'
+            elif personality == 'rookie':
+                # Prefer close-range, safer weapons
+                if 'pulse_cannon' in valid_weapons:
+                    return 'pulse_cannon' if random.random() < 0.7 else random.choice(valid_weapons)
+
+            return random.choice(valid_weapons)
+
+        # Fallback: use old logic if no valid weapons found
         if distance <= 15:
             return random.choice(['pulse_cannon', 'pulse_cannon', 'plasma_launcher'])
-
-        # Medium range (15-25): Both pulse and plasma equally likely
         elif distance <= 25:
             return random.choice(['pulse_cannon', 'plasma_launcher', 'plasma_launcher'])
-
-        # Medium-long range (25-35): Plasma preferred, rail gun possible
         elif distance <= 35:
             return random.choice(['plasma_launcher', 'plasma_launcher', 'rail_gun'])
-
-        # Long range (35-45): Rail gun preferred, plasma possible
         elif distance <= 45:
             return random.choice(['rail_gun', 'rail_gun', 'plasma_launcher'])
 
@@ -1514,7 +1854,70 @@ class DroneManager:
             elif old_health > 25 and drone['health'] <= 25:
                 self.tts.speak("Hostile critical", duck_audio=False)
 
+            # === DISTRESS BEACON SYSTEM ===
+            if DISTRESS_BEACON_ENABLED:
+                # Trigger distress on high damage hit or low health
+                health_percent = (drone['health'] / 100.0) * 100
+                if (damage >= DISTRESS_DAMAGE_THRESHOLD or
+                    health_percent <= DISTRESS_HEALTH_THRESHOLD):
+                    if not drone['distress_active']:
+                        drone['distress_active'] = True
+                        drone['distress_start_time'] = self._get_current_time()
+                        self._activate_distress_beacon(drone)
+
+            # === SUPPRESSION TRIGGER ===
+            if SUPPRESSION_ENABLED:
+                current_time = self._get_current_time()
+                # Track recent damage for suppression calculation
+                if current_time - drone['damage_window_start'] > SUPPRESSION_TIME_WINDOW:
+                    # Reset damage window
+                    drone['damage_window_start'] = current_time
+                    drone['recent_damage'] = 0
+
+                drone['recent_damage'] += damage
+
+                # Check if suppressed (enough damage in time window)
+                if (drone['recent_damage'] >= SUPPRESSION_DAMAGE_THRESHOLD and
+                    not drone['is_suppressed'] and
+                    current_time >= drone['suppression_cooldown_end']):
+                    drone['is_suppressed'] = True
+                    suppression_duration = random.randint(SUPPRESSION_DURATION_MIN, SUPPRESSION_DURATION_MAX)
+                    drone['suppression_end_time'] = current_time + suppression_duration
+                    self.tts.speak("Drone suppressed")
+
         return False
+
+    def _get_current_time(self) -> int:
+        """Get current time in milliseconds (for internal use)."""
+        import pygame
+        return pygame.time.get_ticks()
+
+    def _activate_distress_beacon(self, drone: dict):
+        """Activate distress beacon - alert nearby drones."""
+        # Play distress sound from the damaged drone
+        sound = self.sounds.get_drone_sound('beacons')
+        if sound:
+            dc = self._get_drone_channels(drone['id'])
+            if dc:
+                pos = self._get_drone_3d_position(drone)
+                dc['combat'].play(sound, position_3d=pos)
+
+        # Alert nearby patrol/searching drones
+        for other in self.drones:
+            if other['id'] == drone['id']:
+                continue
+            if other['state'] not in ('patrol', 'searching'):
+                continue
+            if other['distance'] > DISTRESS_ALERT_RANGE:
+                continue
+
+            # Drone responds to distress call
+            other['state'] = 'detecting'
+            other['state_start'] = self._get_current_time()
+            other['last_known_x'] = drone['x']
+            other['last_known_y'] = drone['y']
+            # Speed boost when responding to distress
+            other['speed'] *= DISTRESS_RESPONSE_SPEED_MULT
 
     def _destroy_drone(self, drone: dict):
         """Handle drone destruction with 3D audio positioning."""

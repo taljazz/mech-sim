@@ -80,7 +80,7 @@ class Game:
         # Initialize game systems with dependencies
         self.shield = ShieldSystem(self.audio, self.tts, self.state)
         self.camo = CamouflageSystem(self.audio, self.sounds, self.tts, self.state)
-        self.movement = MovementSystem(self.audio, self.sounds, self.tts, self.state)
+        self.movement = MovementSystem(self.audio, self.sounds, self.tts, self.state, self.camo)
         self.thrusters = ThrusterSystem(self.audio, self.sounds, self.tts, self.state)
 
         # Initialize combat systems
@@ -89,7 +89,7 @@ class Game:
         self.radar = RadarSystem(self.audio, self.sounds, self.tts, self.state, self.drone_manager)
         self.weapons = WeaponSystem(
             self.audio, self.sounds, self.tts, self.state,
-            self.drone_manager, self.shield
+            self.drone_manager, self.shield, self.camo
         )
 
         # Game control
@@ -465,8 +465,8 @@ class Game:
         if self.drone_pool:
             self.drone_pool.update_fades(dt)
 
-        # Update echolocation (accessibility feature)
-        self.radar.update_echolocation(current_time)
+        # Update radar system (echolocation + staggered contact pings)
+        self.radar.update(current_time)
 
         # Hull regeneration when safe
         closest_dist = self.drone_manager.get_closest_drone_distance()

@@ -17,14 +17,17 @@ from state.constants import (
     MISSILE_DAMAGE, MISSILE_RANGE, MISSILE_COUNT,
     BLASTER_COOLDOWN, BLASTER_DAMAGE, BLASTER_RANGE, BLASTER_ARC,
     EMP_COOLDOWN, EMP_DAMAGE, EMP_RANGE,
-    FABRICATION_DURATION, FABRICATION_COST
+    FABRICATION_DURATION, FABRICATION_COST,
+    # Camo reveal durations
+    CAMO_REVEAL_CHAINGUN, CAMO_REVEAL_BLASTER, CAMO_REVEAL_MISSILES, CAMO_REVEAL_EMP,
+    CAMO_AMBUSH_ENABLED, CAMO_AMBUSH_DAMAGE_MULT
 )
 
 
 class WeaponSystem:
     """Manages all player weapons and fabrication."""
 
-    def __init__(self, audio_manager, sound_loader, tts, game_state, drone_manager, shield_system):
+    def __init__(self, audio_manager, sound_loader, tts, game_state, drone_manager, shield_system, camo_system=None):
         """Initialize the weapon system.
 
         Args:
@@ -34,10 +37,12 @@ class WeaponSystem:
             game_state: GameState instance
             drone_manager: DroneManager instance
             shield_system: ShieldSystem instance
+            camo_system: CamouflageSystem instance (optional)
         """
         self.audio = audio_manager
         self.sounds = sound_loader
         self.tts = tts
+        self.camo = camo_system
         self.state = game_state
         self.drones = drone_manager
         self.shield = shield_system
@@ -46,6 +51,27 @@ class WeaponSystem:
         self._blaster_channel = audio_manager.get_channel('blaster')
         self._emp_channel = audio_manager.get_channel('emp')
         self._fab_channel = audio_manager.get_channel('fabrication')
+
+    def _get_ambush_damage(self, base_damage: int) -> int:
+        """Calculate damage with ambush bonus if applicable.
+
+        If camo is active and ambush is ready, applies damage multiplier
+        and consumes the ambush bonus.
+
+        Args:
+            base_damage: Base weapon damage
+
+        Returns:
+            Damage to deal (base or boosted)
+        """
+        if CAMO_AMBUSH_ENABLED and self.state.camo_ambush_ready and self.state.camo_active:
+            # Consume ambush bonus
+            self.state.camo_ambush_ready = False
+            boosted_damage = int(base_damage * CAMO_AMBUSH_DAMAGE_MULT)
+            self.tts.speak("Ambush!")
+            print(f"Camo: Ambush bonus! {base_damage} -> {boosted_damage} damage")
+            return boosted_damage
+        return base_damage
 
     def switch_weapon(self, weapon_num: int):
         """Switch to a different weapon.
@@ -146,8 +172,9 @@ class WeaponSystem:
                 self.state.chaingun_state = 'starting'
                 self.tts.speak(f"{gun_name} spinning up")
                 print(f"{gun_name}: Starting")
-                if reveal_callback:
-                    reveal_callback(current_time)
+                # Use weapon-specific reveal duration
+                if self.camo:
+                    self.camo.reveal(current_time, CAMO_REVEAL_CHAINGUN, self.drones)
             elif self.state.ammo[WEAPON_CHAINGUN] <= 0:
                 self.tts.speak(f"{gun_name} out of ammo")
                 print(f"{gun_name}: No ammo!")
@@ -176,7 +203,8 @@ class WeaponSystem:
                 targets = self.drones.get_drones_in_range(CHAINGUN_RANGE, CHAINGUN_ARC)
                 if targets:
                     target = min(targets, key=lambda d: d['distance'])
-                    self.drones.damage_drone(target, CHAINGUN_DAMAGE)
+                    damage = self._get_ambush_damage(CHAINGUN_DAMAGE)
+                    self.drones.damage_drone(target, damage)
                     print(f"{gun_name}: Hit!")
 
             if self.state.ammo[WEAPON_CHAINGUN] <= 0:
@@ -320,18 +348,23 @@ class WeaponSystem:
         # Trigger drone sound reactions to player firing
         self.drones.react_to_player_fire(current_time)
 
-        if reveal_callback:
-            reveal_callback(current_time)
+        # Use weapon-specific reveal duration (missiles are loud!)
+        if self.camo:
+            self.camo.reveal(current_time, CAMO_REVEAL_MISSILES, self.drones)
 
         # Hit drones in range
         targets = self.drones.get_drones_in_range(MISSILE_RANGE)
         targets = sorted(targets, key=lambda d: d['distance'])
         missiles_remaining = MISSILE_COUNT
         hits = 0
+        # First missile gets ambush bonus
+        first_hit = True
         for drone in targets:
             if missiles_remaining <= 0:
                 break
-            self.drones.damage_drone(drone, MISSILE_DAMAGE)
+            damage = self._get_ambush_damage(MISSILE_DAMAGE) if first_hit else MISSILE_DAMAGE
+            first_hit = False
+            self.drones.damage_drone(drone, damage)
             missiles_remaining -= 1
             hits += 1
 
@@ -348,8 +381,10 @@ class WeaponSystem:
                     self.state.blaster_last_shot = current_time
                     self.state.ammo[WEAPON_BLASTER] -= 1
                     print(f"Blaster: Fire! (Ammo: {self.state.ammo[WEAPON_BLASTER]})")
-                    if reveal_callback:
-                        reveal_callback(current_time)
+
+                    # Use weapon-specific reveal duration (blaster is quieter)
+                    if self.camo:
+                        self.camo.reveal(current_time, CAMO_REVEAL_BLASTER, self.drones)
 
                     # Trigger drone sound reactions to player firing
                     self.drones.react_to_player_fire(current_time)
@@ -358,7 +393,8 @@ class WeaponSystem:
                     targets = self.drones.get_drones_in_range(BLASTER_RANGE, BLASTER_ARC)
                     if targets:
                         target = min(targets, key=lambda d: d['distance'])
-                        self.drones.damage_drone(target, BLASTER_DAMAGE)
+                        damage = self._get_ambush_damage(BLASTER_DAMAGE)
+                        self.drones.damage_drone(target, damage)
                         self.tts.speak("Direct hit")
                     else:
                         self.tts.speak("Miss")
@@ -377,16 +413,22 @@ class WeaponSystem:
                     self.state.ammo[WEAPON_EMP] -= 1
                     self.tts.speak("E M P fired")
                     print(f"EMP: Fired! (Charges: {self.state.ammo[WEAPON_EMP]})")
-                    if reveal_callback:
-                        reveal_callback(current_time)
+
+                    # Use weapon-specific reveal duration (EMP has strong tech signature)
+                    if self.camo:
+                        self.camo.reveal(current_time, CAMO_REVEAL_EMP, self.drones)
 
                     # Trigger drone sound reactions to player firing
                     self.drones.react_to_player_fire(current_time)
 
                     # Damage all drones in range
                     targets = self.drones.get_drones_in_range(EMP_RANGE)
+                    first_hit = True
                     for drone in targets:
-                        self.drones.damage_drone(drone, EMP_DAMAGE)
+                        # First hit gets ambush bonus
+                        damage = self._get_ambush_damage(EMP_DAMAGE) if first_hit else EMP_DAMAGE
+                        first_hit = False
+                        self.drones.damage_drone(drone, damage)
                     if targets:
                         self.tts.speak(f"{len(targets)} targets hit")
                         print(f"EMP: Hit {len(targets)} drone(s)!")

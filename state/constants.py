@@ -137,8 +137,38 @@ TERMINAL_VELOCITY = -60.0 # Maximum fall speed (negative = down)
 CAMO_ENERGY_MAX = 100.0
 CAMO_DRAIN_RATE = 5.0     # Energy per second
 CAMO_REGEN_RATE = 10.0    # Energy per second when inactive
-CAMO_REVEAL_DURATION = 3000  # Milliseconds
+CAMO_REVEAL_DURATION = 3000  # Milliseconds (default, used by movement)
 CAMO_DETECT_RANGE = 5     # Meters (drones must be this close to detect)
+
+# Weapon-specific reveal durations (milliseconds)
+CAMO_REVEAL_CHAINGUN = 3000   # Loud sustained fire
+CAMO_REVEAL_BLASTER = 2000    # Single shots, less loud
+CAMO_REVEAL_MISSILES = 5000   # Very loud launch signature
+CAMO_REVEAL_EMP = 4000        # Powerful tech signature
+CAMO_REVEAL_FOOTSTEP = 1500   # Footsteps reveal for shorter time
+
+# Partial camo recovery (extend reveal instead of resetting)
+CAMO_REVEAL_EXTEND_MS = 500   # Add this much time per action instead of full reset
+
+# Camo footstep attenuation
+CAMO_FOOTSTEP_VOLUME_MULT = 0.5  # 50% volume while camo active
+
+# Camo sound detection reduction
+CAMO_SOUND_DETECTION_RANGE_MULT = 0.5  # Sound detection range halved while camo active
+
+# Camo proximity warning
+CAMO_PROXIMITY_WARNING_ENABLED = True
+CAMO_PROXIMITY_WARNING_RANGE = 8   # meters - warn when drone within this range
+CAMO_PROXIMITY_WARNING_INTERVAL = 1500  # ms between warning pings
+
+# Camo ambush bonus
+CAMO_AMBUSH_ENABLED = True
+CAMO_AMBUSH_DAMAGE_MULT = 1.5  # 50% extra damage on first attack from camo
+
+# Drone confusion on camo reveal
+CAMO_CONFUSION_ENABLED = True
+CAMO_CONFUSION_DURATION = 800  # ms - drones confused when camo breaks
+CAMO_CONFUSION_LOSE_LOCK_RANGE = 20  # meters - drones beyond this lose lock on reveal
 
 # =============================================================================
 # RESOURCES
@@ -179,8 +209,8 @@ DRONE_SPAWN_DISTANCE_MIN = 15  # Can spawn close for immediate threat
 DRONE_SPAWN_DISTANCE_MAX = 80  # Or far away, giving time to prepare
 DRONE_BASE_SPEED = 5.0
 DRONE_CLIMB_RATE = 15.0  # Feet per second
-DRONE_ENGAGE_SPEED_MULT = 2.0  # Speed multiplier when engaging (increased from 1.5)
-DRONE_EVASION_SPEED = 8.0  # Lateral evasion speed when being aimed at
+DRONE_ENGAGE_SPEED_MULT = 1.3  # Speed multiplier when engaging (reduced for better audio sync)
+DRONE_EVASION_SPEED = 5.0  # Lateral evasion speed when being aimed at (reduced for smoother audio)
 DRONE_EVASION_ANGLE = 30  # Player must be within this angle to trigger evasion
 
 # Drone detection ranges
@@ -319,6 +349,34 @@ DRONE_PERSONALITY_WEIGHTS = {
     'berserker': 10
 }
 
+# Personality-based weapon preferences (distance ranges for each weapon)
+PERSONALITY_WEAPON_PREFS = {
+    'rookie': {
+        # Rookies prefer close range (safer, less skill needed)
+        'pulse_cannon': (0, 18),    # Strongly prefers close combat
+        'plasma_launcher': (15, 28),
+        'rail_gun': (25, 40),       # Rarely uses long range
+    },
+    'veteran': {
+        # Balanced usage
+        'pulse_cannon': (0, 15),
+        'plasma_launcher': (12, 32),
+        'rail_gun': (28, 45),
+    },
+    'ace': {
+        # Optimal weapon selection for range
+        'pulse_cannon': (0, 12),    # Only close range
+        'plasma_launcher': (10, 30),
+        'rail_gun': (25, 50),       # Prefers precision long range
+    },
+    'berserker': {
+        # Aggressive, prefers high damage
+        'pulse_cannon': (0, 10),    # Quick bursts
+        'plasma_launcher': (8, 35), # High DPS preferred
+        'rail_gun': (30, 50),       # Max damage at range
+    }
+}
+
 # =============================================================================
 # DRONE EVASION SETTINGS
 # =============================================================================
@@ -342,6 +400,12 @@ SEARCH_SPIRAL_EXPANSION = 5   # Meters per revolution
 SEARCH_ZIGZAG_WIDTH = 10      # Meters side-to-side
 SEARCH_WANDER_DISTANCE = 8    # Meters per waypoint
 
+# Expanding search radius over time
+SEARCH_EXPAND_ENABLED = True
+SEARCH_EXPAND_INTERVAL = 2000     # ms - expand search every 2 seconds
+SEARCH_EXPAND_MULTIPLIER = 1.3    # Expand radius by 30% each interval
+SEARCH_EXPAND_MAX_MULT = 3.0      # Maximum expansion multiplier
+
 # =============================================================================
 # DRONE COORDINATION / FLANKING
 # =============================================================================
@@ -359,12 +423,73 @@ ATTACK_FRUSTRATION_THRESHOLD = 0.2  # Hit rate below this = frustrated
 ATTACK_BREAK_OFF_CHANCE = 0.5       # Chance to break off when frustrated
 ATTACK_MIN_SHOTS_BEFORE_ADAPT = 4   # Minimum shots before considering break-off
 
+# Context-aware attack adaptation
+ATTACK_ADAPTATION_ENABLED = True
+ATTACK_WEAPON_SWITCH_THRESHOLD = 0.15  # Switch weapon if hit rate below this
+ATTACK_RANGE_ADJUST_THRESHOLD = 0.25   # Adjust attack range preference if struggling
+
+# =============================================================================
+# DRONE WOUNDED STATE
+# =============================================================================
+WOUNDED_HEALTH_THRESHOLD = 25       # Health % to enter wounded state
+WOUNDED_EVASION_MULT = 1.5          # Evasion skill multiplier when wounded
+WOUNDED_AGGRESSION_MULT = 0.4       # Aggression reduction when wounded
+WOUNDED_SPEED_MULT = 0.7            # Speed reduction when wounded (erratic)
+WOUNDED_ERRATIC_INTERVAL = 0.2      # Seconds between erratic movements
+
+# =============================================================================
+# DRONE SUPPRESSION STATE
+# =============================================================================
+SUPPRESSION_ENABLED = True
+SUPPRESSION_DAMAGE_THRESHOLD = 15   # Damage in time window to trigger suppression
+SUPPRESSION_TIME_WINDOW = 1000      # ms - window to accumulate damage
+SUPPRESSION_DURATION_MIN = 500      # ms - minimum suppression duration
+SUPPRESSION_DURATION_MAX = 1200     # ms - maximum suppression duration
+SUPPRESSION_COOLDOWN = 3000         # ms - can't be suppressed again for this long
+
+# =============================================================================
+# DRONE DISTRESS BEACON
+# =============================================================================
+DISTRESS_BEACON_ENABLED = True
+DISTRESS_DAMAGE_THRESHOLD = 40      # Single hit damage to trigger distress
+DISTRESS_HEALTH_THRESHOLD = 30      # Health % to trigger distress
+DISTRESS_BEACON_DURATION = 3000     # ms - how long beacon is active
+DISTRESS_ALERT_RANGE = 60           # meters - drones within this react to distress
+DISTRESS_RESPONSE_SPEED_MULT = 1.3  # Speed multiplier for responding drones
+
+# =============================================================================
+# DRONE COORDINATED ASSAULT
+# =============================================================================
+COORDINATED_ASSAULT_ENABLED = True
+COORDINATED_ASSAULT_RANGE = 30      # meters - drones must be within this to coordinate
+COORDINATED_ASSAULT_SYNC_WINDOW = 300  # ms - attack timing synchronization
+COORDINATED_ASSAULT_CONVERGE_ANGLE = 45  # degrees - angle to converge from
+
+# =============================================================================
+# ALTITUDE-BASED FLANKING
+# =============================================================================
+ALTITUDE_FLANK_ENABLED = True
+ALTITUDE_FLANK_OFFSET_MIN = 15      # feet - minimum altitude difference
+ALTITUDE_FLANK_OFFSET_MAX = 30      # feet - maximum altitude difference
+
+# =============================================================================
+# EVASION FEINTING
+# =============================================================================
+FEINT_ENABLED = True
+FEINT_CHANCE = 0.20                 # 20% chance to feint
+FEINT_DOUBLE_BACK_DELAY = 0.15      # seconds - delay before double-back
+
 # =============================================================================
 # DRONE SOUND REACTIONS
 # =============================================================================
 SOUND_REACTION_RANGE = 50     # Meters - drones within this react to player fire
 SOUND_REACTION_DODGE_CHANCE = 0.7   # Chance to dodge vs advance
 SOUND_REACTION_COOLDOWN = 1000      # ms - minimum time between reactions
+
+# Sound-based detection (patrol drones can hear weapon fire)
+SOUND_DETECTION_ENABLED = True
+SOUND_DETECTION_RANGE = 100   # Meters - patrol drones can detect player at this range
+SOUND_DETECTION_CHANCE = 0.7  # Chance to detect on weapon fire
 
 # =============================================================================
 # LANDING
